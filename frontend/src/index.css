@@ -1,0 +1,126 @@
+@import "tailwindcss";
+
+/* ===== VOUCH DESIGN TOKENS — Warm Editorial ===== */
+@theme {
+  --color-cream: #faf7f2;
+  --color-cream-deep: #f3ede4;
+  --color-warm-white: #fefcf9;
+  --color-charcoal: #1a1714;
+  --color-charcoal-soft: #2d2926;
+  --color-text-body: #4a4541;
+  --color-text-muted: #8a8480;
+  --color-terracotta: #c2653a;
+  --color-terracotta-light: #e8a882;
+  --color-amber: #d4943a;
+  --color-sage: #7a8c72;
+  --color-sage-light: #e8ede5;
+  --color-stone: #d6cfc5;
+  --color-stone-light: #eae6df;
+
+  /* Legacy aliases used across components */
+  --color-brand-orange: #c2653a;
+  --color-brand-yellow: #d4943a;
+  --color-primary-text: #1a1714;
+  --color-secondary-text: #8a8480;
+  --color-surface: #f3ede4;
+  --color-divider: #eae6df;
+  --color-background: #faf7f2;
+
+  --font-serif: "Libre Baskerville", Georgia, serif;
+  --font-sans: "Outfit", system-ui, -apple-system, sans-serif;
+
+  --radius-md: 14px;
+  --radius-lg: 20px;
+}
+
+/* ===== BASE STYLES ===== */
+html {
+  font-family: var(--font-sans);
+  color: var(--color-text-body);
+  background-color: var(--color-cream);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100dvh;
+  line-height: 1.7;
+}
+
+/* Subtle grain texture overlay like the landing page */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0.02;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 256px;
+}
+
+/* ===== TYPOGRAPHY UTILITIES ===== */
+.font-display {
+  font-family: var(--font-serif);
+}
+
+.font-body {
+  font-family: var(--font-sans);
+}
+
+/* Score display — Libre Baskerville in amber/sage */
+.score-display {
+  font-family: var(--font-serif);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.score-display-sm { font-size: 1rem; }
+.score-display-md { font-size: 2rem; }
+.score-display-lg { font-size: 3.5rem; }
+
+/* Score color classes */
+.score-high { color: var(--color-sage); }       /* 9-10 */
+.score-good { color: var(--color-amber); }       /* 7-8 */
+.score-mid  { color: var(--color-text-muted); }   /* 5-6 */
+.score-low  { color: var(--color-terracotta); }   /* 0-4 */
+
+/* Section labels — terracotta all-caps markers */
+.section-label {
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-terracotta);
+}
+
+/* Hero italic — matching landing page treatment */
+.hero-italic {
+  font-family: var(--font-serif);
+  font-style: italic;
+  color: var(--color-terracotta);
+}
+
+/* ===== SCROLLBAR UTILITIES ===== */
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* ===== TRANSITIONS ===== */
+.transition-vouch {
+  transition: all 0.3s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+/* ===== LANDING PAGE ANIMATIONS ===== */
+@keyframes floaty {
+  0%, 100% { transform: rotate(-3deg) translateY(0); }
+  50% { transform: rotate(-3deg) translateY(-8px); }
+}

@@ -1,0 +1,544 @@
+import { useState, useEffect, useCallback } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { LogOut, Settings, Edit3, MapPin, Star, Bookmark, Users, ChevronRight } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import Avatar from '../components/ui/Avatar';
+import VouchScore from '../components/ui/VouchScore';
+import ScoreLabel from '../components/ui/ScoreLabel';
+import ScoreBreakdown from '../components/ui/ScoreBreakdown';
+import CategoryTag from '../components/ui/CategoryTag';
+import SectionLabel from '../components/ui/SectionLabel';
+import Card from '../components/ui/Card';
+import Button from '../components/ui/Button';
+import { CATEGORIES, COLORS } from '../lib/constants';
+import { api } from '../lib/api';
+
+const TABS = [
+  { key: 'ratings', label: 'Ratings', icon: Star },
+  { key: 'wishlist', label: 'Wishlist', icon: Bookmark },
+  { key: 'lists', label: 'Lists', icon: Users },
+];
+
+// ── Rating Card ────────────────────────────────────────────────
+function RatingCard({ rating, onClick }) {
+  return (
+    <Card className="!p-0 overflow-hidden cursor-pointer hover:shadow-md transition-shadow" onClick={onClick}>
+      {rating.experience_cover_photo ? (
+        <img
+          src={rating.experience_cover_photo}
+          alt={rating.experience_name}
+          className="w-full h-28 object-cover"
+        />
+      ) : (
+        <div className="w-full h-28 bg-gradient-to-br from-surface to-divider flex items-center justify-center">
+          <MapPin size={24} className="text-secondary-text" />
+        </div>
+      )}
+      <div className="p-3">
+        <div className="flex items-start justify-between gap-2">
+          <CategoryTag category={rating.experience_category} variant="gray" />
+          <VouchScore score={rating.overall_score} size="sm" />
+        </div>
+        <h4 className="font-serif text-sm font-bold mt-2 leading-tight line-clamp-2">
+          {rating.experience_name}
+        </h4>
+        <div className="mt-1.5">
+          <ScoreLabel score={rating.overall_score} />
+        </div>
+        {rating.review_text && (
+          <p className="text-xs text-secondary-text mt-1.5 line-clamp-2">{rating.review_text}</p>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+// ── Wishlist Card ──────────────────────────────────────────────
+function WishlistCard({ experience, onClick }) {
+  return (
+    <Card className="!p-0 overflow-hidden cursor-pointer hover:shadow-md transition-shadow" onClick={onClick}>
+      {experience.cover_photo_url ? (
+        <img
+          src={experience.cover_photo_url}
+          alt={experience.name}
+          className="w-full h-28 object-cover"
+        />
+      ) : (
+        <div className="w-full h-28 bg-gradient-to-br from-surface to-divider flex items-center justify-center">
+          <Bookmark size={24} className="text-secondary-text" />
+        </div>
+      )}
+      <div className="p-3">
+        <CategoryTag category={experience.category} variant="gray" />
+        <h4 className="font-serif text-sm font-bold mt-2 leading-tight line-clamp-2">
+          {experience.name}
+        </h4>
+        {experience.neighborhood && (
+          <p className="text-xs text-secondary-text mt-1 flex items-center gap-1">
+            <MapPin size={10} /> {experience.neighborhood}
+          </p>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+// ── Edit Profile Modal ─────────────────────────────────────────
+function EditProfileModal({ user, onClose, onSave }) {
+  const [displayName, setDisplayName] = useState(user?.display_name || '');
+  const [bio, setBio] = useState(user?.bio || '');
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await onSave({ display_name: displayName, bio });
+      onClose();
+    } catch {
+      // keep modal open
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-charcoal/40 backdrop-blur-sm p-4">
+      <div className="bg-warm-white rounded-2xl shadow-xl w-full max-w-md">
+        <div className="flex items-center justify-between p-4 border-b border-stone-light">
+          <h2 className="font-serif text-lg font-bold">Edit Profile</h2>
+          <button onClick={onClose} className="text-secondary-text hover:text-primary-text text-xl">×</button>
+        </div>
+        <div className="p-4 space-y-4">
+          <div>
+            <label className="text-xs font-semibold text-secondary-text uppercase tracking-wider">Display Name</label>
+            <input
+              type="text"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              maxLength={100}
+              className="mt-1 w-full px-3 py-2 border border-stone rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta"
+            />
+          </div>
+          <div>
+            <label className="text-xs font-semibold text-text-muted uppercase tracking-wider">Bio</label>
+            <textarea
+              value={bio}
+              onChange={(e) => setBio(e.target.value)}
+              maxLength={300}
+              rows={3}
+              className="mt-1 w-full px-3 py-2 border border-stone rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta"
+              placeholder="Tell people about yourself..."
+            />
+            <p className="text-right text-[10px] text-secondary-text mt-0.5">{bio.length}/300</p>
+          </div>
+        </div>
+        <div className="flex gap-2 p-4 border-t border-stone-light">
+          <Button variant="ghost" size="sm" className="flex-1" onClick={onClose}>Cancel</Button>
+          <Button
+            size="sm"
+            className="flex-1"
+            onClick={handleSave}
+            disabled={saving || !displayName.trim()}
+          >
+            {saving ? 'Saving…' : 'Save'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Followers/Following Modal ──────────────────────────────────
+function PeopleModal({ title, people, onClose, onViewProfile }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-charcoal/40 backdrop-blur-sm p-4">
+      <div className="bg-warm-white rounded-2xl shadow-xl w-full max-w-sm max-h-[70vh] flex flex-col">
+        <div className="flex items-center justify-between p-4 border-b border-stone-light">
+          <h2 className="font-serif text-lg font-bold">{title}</h2>
+          <button onClick={onClose} className="text-secondary-text hover:text-primary-text text-xl">×</button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-2">
+          {people.length === 0 ? (
+            <p className="text-sm text-secondary-text text-center py-8">No one yet</p>
+          ) : (
+            people.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => { onClose(); onViewProfile(p.id); }}
+                className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-cream-deep transition-vouch"
+              >
+                <Avatar name={p.display_name} src={p.avatar_url} size="md" />
+                <div className="text-left flex-1 min-w-0">
+                  <p className="text-sm font-semibold text-primary-text truncate">{p.display_name}</p>
+                  <p className="text-xs text-terracotta">@{p.username}</p>
+                </div>
+                <ChevronRight size={16} className="text-secondary-text shrink-0" />
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main Profile Component ─────────────────────────────────────
+export default function Profile() {
+  const { user, logout, refreshUser } = useAuth();
+  const navigate = useNavigate();
+  const { userId } = useParams();
+
+  // Determine whose profile we're viewing
+  const isOwnProfile = !userId || userId === String(user?.id);
+  const profileUserId = isOwnProfile ? user?.id : userId;
+
+  const [profileUser, setProfileUser] = useState(isOwnProfile ? user : null);
+  const [stats, setStats] = useState(null);
+  const [ratings, setRatings] = useState([]);
+  const [wishlistItems, setWishlistItems] = useState([]);
+  const [activeTab, setActiveTab] = useState('ratings');
+  const [loading, setLoading] = useState(true);
+  const [showEdit, setShowEdit] = useState(false);
+  const [peopleModal, setPeopleModal] = useState(null); // { title, people }
+  const [isFollowing, setIsFollowing] = useState(false);
+
+  const loadProfile = useCallback(async () => {
+    if (!profileUserId) return;
+    setLoading(true);
+    try {
+      const promises = [
+        api.users.getStats(profileUserId),
+        api.users.getRatings(profileUserId),
+      ];
+
+      if (!isOwnProfile) {
+        promises.push(api.users.getProfile(profileUserId));
+      }
+      if (isOwnProfile) {
+        promises.push(api.wishlist.getExperiences());
+      }
+
+      const results = await Promise.all(promises);
+      setStats(results[0]);
+      setRatings(results[1] || []);
+
+      if (!isOwnProfile) {
+        setProfileUser(results[2]);
+      } else {
+        setProfileUser(user);
+        setWishlistItems(results[2] || []);
+      }
+    } catch (err) {
+      console.error('Failed to load profile:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, [profileUserId, isOwnProfile, user]);
+
+  // Check follow status for other users
+  useEffect(() => {
+    if (!isOwnProfile && user?.id) {
+      api.users.getFollowing(user.id).then((following) => {
+        setIsFollowing(following.some((f) => String(f.id) === String(profileUserId)));
+      }).catch(() => {});
+    }
+  }, [isOwnProfile, user?.id, profileUserId]);
+
+  useEffect(() => {
+    loadProfile();
+  }, [loadProfile]);
+
+  // Keep own profile user in sync
+  useEffect(() => {
+    if (isOwnProfile && user) setProfileUser(user);
+  }, [user, isOwnProfile]);
+
+  const handleEditSave = async (data) => {
+    await api.users.updateProfile(data);
+    if (refreshUser) await refreshUser();
+  };
+
+  const handleFollow = async () => {
+    try {
+      if (isFollowing) {
+        await api.users.unfollow(profileUserId);
+        setIsFollowing(false);
+        setStats((s) => s ? { ...s, follower_count: Math.max(0, s.follower_count - 1) } : s);
+      } else {
+        await api.users.follow(profileUserId);
+        setIsFollowing(true);
+        setStats((s) => s ? { ...s, follower_count: s.follower_count + 1 } : s);
+      }
+    } catch (err) {
+      console.error('Follow/unfollow failed:', err);
+    }
+  };
+
+  const showPeople = async (type) => {
+    try {
+      const people = type === 'followers'
+        ? await api.users.getFollowers(profileUserId)
+        : await api.users.getFollowing(profileUserId);
+      setPeopleModal({
+        title: type === 'followers' ? 'Followers' : 'Following',
+        people,
+      });
+    } catch {
+      // silent fail
+    }
+  };
+
+  const viewUserProfile = (uid) => {
+    navigate(`/profile/${uid}`);
+  };
+
+  const categories = profileUser?.selected_categories
+    ? profileUser.selected_categories.split(',').filter(Boolean)
+    : [];
+
+  return (
+    <div className="pb-20 lg:pb-8">
+      {/* Mobile-only action buttons */}
+      {isOwnProfile && (
+        <div className="sticky top-0 z-40 flex items-center justify-end gap-3 px-4 lg:hidden py-3">
+          <button
+            onClick={() => navigate('/settings')}
+            className="text-text-muted hover:text-charcoal transition-vouch"
+          >
+            <Settings size={18} />
+          </button>
+          <button
+            onClick={logout}
+            className="flex items-center gap-1.5 text-text-muted hover:text-charcoal transition-vouch"
+          >
+            <LogOut size={18} />
+          </button>
+        </div>
+      )}
+
+      {loading && !profileUser ? (
+        <div className="flex justify-center py-20">
+          <div className="w-8 h-8 border-2 border-terracotta border-t-transparent rounded-full animate-spin" />
+        </div>
+      ) : (
+        <div className="px-4 lg:px-8 max-w-6xl mx-auto">
+          {/* User header */}
+          <div className="flex items-center gap-4 mt-4">
+            <Avatar name={profileUser?.display_name || 'User'} src={profileUser?.avatar_url} size="lg" />
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <h2 className="font-serif text-xl font-bold truncate">{profileUser?.display_name}</h2>
+                {isOwnProfile && (
+                  <button
+                    onClick={() => setShowEdit(true)}
+                    className="text-text-muted hover:text-terracotta transition-vouch shrink-0"
+                  >
+                    <Edit3 size={14} />
+                  </button>
+                )}
+              </div>
+              <p className="text-sm text-terracotta font-medium">@{profileUser?.username}</p>
+              {profileUser?.bio && (
+                <p className="text-sm text-secondary-text mt-0.5 line-clamp-2">{profileUser.bio}</p>
+              )}
+            </div>
+
+            {/* Average score badge */}
+            {stats?.avg_overall_score && (
+              <div className="text-center shrink-0">
+                <div className="w-14 h-14 rounded-full bg-amber/20 border-2 border-amber flex items-center justify-center">
+                  <span className="font-serif font-bold text-lg text-charcoal">
+                    {stats.avg_overall_score}
+                  </span>
+                </div>
+                <span className="text-[9px] text-secondary-text mt-0.5 block">Avg Score</span>
+              </div>
+            )}
+          </div>
+
+          {/* Follow button (other user) */}
+          {!isOwnProfile && (
+            <div className="mt-3">
+              <Button
+                size="sm"
+                variant={isFollowing ? 'ghost' : 'primary'}
+                className="w-full"
+                onClick={handleFollow}
+              >
+                {isFollowing ? 'Following ✓' : 'Follow'}
+              </Button>
+            </div>
+          )}
+
+          {/* Stats bar */}
+          <div className="flex items-center justify-between mt-4 py-3 px-4 bg-surface rounded-xl border border-divider">
+            <div className="text-center flex-1">
+              <p className="font-serif font-bold text-lg">{stats?.rating_count ?? 0}</p>
+              <p className="text-[10px] text-secondary-text uppercase font-semibold tracking-wide">Rated</p>
+            </div>
+            <div className="w-px h-8 bg-divider" />
+            <button className="text-center flex-1" onClick={() => showPeople('followers')}>
+              <p className="font-serif font-bold text-lg">{stats?.follower_count ?? 0}</p>
+              <p className="text-[10px] text-secondary-text uppercase font-semibold tracking-wide">Followers</p>
+            </button>
+            <div className="w-px h-8 bg-divider" />
+            <button className="text-center flex-1" onClick={() => showPeople('following')}>
+              <p className="font-serif font-bold text-lg">{stats?.following_count ?? 0}</p>
+              <p className="text-[10px] text-secondary-text uppercase font-semibold tracking-wide">Following</p>
+            </button>
+            {isOwnProfile && (
+              <>
+                <div className="w-px h-8 bg-divider" />
+                <div className="text-center flex-1">
+                  <p className="font-serif font-bold text-lg">{stats?.wishlist_count ?? 0}</p>
+                  <p className="text-[10px] text-secondary-text uppercase font-semibold tracking-wide">Saved</p>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Streak */}
+          {isOwnProfile && (
+            <div className="flex items-center gap-2 mt-4">
+              <span className="text-lg">🔥</span>
+              <span className="text-sm font-semibold text-primary-text">
+                {profileUser?.streak_weeks || 0} week streak
+              </span>
+            </div>
+          )}
+
+          {/* Categories */}
+          {categories.length > 0 && (
+            <div className="mt-5">
+              <SectionLabel text={isOwnProfile ? 'Your Categories' : 'Categories'} />
+              <div className="flex flex-wrap gap-2 mt-2">
+                {categories.map((cat) => (
+                  <CategoryTag key={cat} category={cat} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Tabs */}
+          <div className="mt-6 border-b border-divider">
+            <div className="flex">
+              {TABS.filter((t) => isOwnProfile || t.key === 'ratings').map((tab) => {
+                const Icon = tab.icon;
+                const isActive = activeTab === tab.key;
+                const count = tab.key === 'ratings' ? stats?.rating_count
+                  : tab.key === 'wishlist' ? stats?.wishlist_count
+                  : 0;
+                return (
+                  <button
+                    key={tab.key}
+                    onClick={() => setActiveTab(tab.key)}
+                    className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium transition-vouch border-b-2 ${
+                      isActive
+                        ? 'text-terracotta border-terracotta'
+                        : 'text-text-muted border-transparent hover:text-charcoal'
+                    }`}
+                  >
+                    <Icon size={14} />
+                    {tab.label}
+                    {count > 0 && (
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${
+                        isActive ? 'bg-terracotta/10 text-terracotta' : 'bg-cream-deep text-text-muted'
+                      }`}>
+                        {count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Tab content */}
+          <div className="mt-4 mb-6">
+            {/* Ratings tab */}
+            {activeTab === 'ratings' && (
+              <div>
+                {ratings.length === 0 ? (
+                  <div className="py-12 text-center bg-surface rounded-xl border border-divider">
+                    <Star size={28} className="mx-auto text-secondary-text mb-2" />
+                    <p className="text-sm text-secondary-text">
+                      {isOwnProfile ? 'No ratings yet — go explore!' : 'No ratings yet'}
+                    </p>
+                    {isOwnProfile && (
+                      <Button variant="ghost" size="sm" className="mt-3" onClick={() => navigate('/search')}>
+                        Find experiences
+                      </Button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 lg:gap-4">
+                    {ratings.map((r) => (
+                      <RatingCard
+                        key={r.id}
+                        rating={r}
+                        onClick={() => navigate(`/experience/${r.experience_id}`)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Wishlist tab */}
+            {activeTab === 'wishlist' && isOwnProfile && (
+              <div>
+                {wishlistItems.length === 0 ? (
+                  <div className="py-12 text-center bg-surface rounded-xl border border-divider">
+                    <Bookmark size={28} className="mx-auto text-secondary-text mb-2" />
+                    <p className="text-sm text-secondary-text">Save experiences you want to try</p>
+                    <Button variant="ghost" size="sm" className="mt-3" onClick={() => navigate('/search')}>
+                      Discover places
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 lg:gap-4">
+                    {wishlistItems.map((exp) => (
+                      <WishlistCard
+                        key={exp.id}
+                        experience={exp}
+                        onClick={() => navigate(`/experience/${exp.id}`)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Lists tab */}
+            {activeTab === 'lists' && isOwnProfile && (
+              <div className="py-12 text-center bg-surface rounded-xl border border-divider">
+                <Users size={28} className="mx-auto text-secondary-text mb-2" />
+                <p className="text-sm text-secondary-text">No lists yet</p>
+                <Button variant="ghost" size="sm" className="mt-3">Create your first list</Button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Edit profile modal */}
+      {showEdit && (
+        <EditProfileModal
+          user={profileUser}
+          onClose={() => setShowEdit(false)}
+          onSave={handleEditSave}
+        />
+      )}
+
+      {/* Followers/Following modal */}
+      {peopleModal && (
+        <PeopleModal
+          title={peopleModal.title}
+          people={peopleModal.people}
+          onClose={() => setPeopleModal(null)}
+          onViewProfile={viewUserProfile}
+        />
+      )}
+    </div>
+  );
+}
