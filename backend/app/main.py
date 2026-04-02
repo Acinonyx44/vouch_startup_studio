@@ -20,7 +20,8 @@ _cors_origins = [
     "http://127.0.0.1:5173",
 ]
 if os.getenv("FRONTEND_URL"):
-    _cors_origins.append(os.getenv("FRONTEND_URL"))
+    frontend = os.getenv("FRONTEND_URL")
+    _cors_origins.append(frontend if frontend.startswith("http") else f"https://{frontend}")
 
 app.add_middleware(
     CORSMiddleware,
