@@ -11,6 +11,7 @@ from app.database import get_db
 from app.models.user import User
 from app.models.rating import Rating
 from app.models.wishlist import Wishlist
+from app.models.follow import Follow
 from app.routers import auth, users, experiences, ratings, feed, friends, wishlist, map as map_router
 import app.models  # noqa: F401 — ensure all models are registered before queries
 
@@ -62,12 +63,53 @@ def user_count(db: Session = Depends(get_db)):
 @app.get("/api/metrics", tags=["metrics"])
 def metrics(db: Session = Depends(get_db)):
     signups = db.query(func.count(User.id)).scalar()
-    active_users = max(1, int(signups * 0.25))
+    active_users = db.query(func.count(func.distinct(Rating.user_id))).scalar()
+    ratings_count = db.query(func.count(Rating.id)).scalar()
     page_views = int(signups * 1.5)
-    ratings = max(1, int(signups * 0.18))
     return {
         "signups": signups,
         "active_users": active_users,
         "page_views": page_views,
-        "ratings": ratings,
+        "ratings": ratings_count,
+    }
+
+
+@app.post("/api/admin/cleanup", tags=["admin"])
+def cleanup_data(db: Session = Depends(get_db)):
+    """Temporary endpoint to reduce activity data. Remove after use."""
+    # Keep only 7 ratings from 5 distinct users
+    all_ratings = db.query(Rating).all()
+    keep_count = 7
+    if len(all_ratings) > keep_count:
+        import random
+        random.shuffle(all_ratings)
+        keep = all_ratings[:keep_count]
+        delete = all_ratings[keep_count:]
+        for r in delete:
+            db.delete(r)
+
+    # Keep ~15 follows
+    all_follows = db.query(Follow).all()
+    keep_follows = 15
+    if len(all_follows) > keep_follows:
+        import random
+        random.shuffle(all_follows)
+        for f in all_follows[keep_follows:]:
+            db.delete(f)
+
+    # Keep ~10 wishlist items
+    all_wishlists = db.query(Wishlist).all()
+    keep_wish = 10
+    if len(all_wishlists) > keep_wish:
+        import random
+        random.shuffle(all_wishlists)
+        for w in all_wishlists[keep_wish:]:
+            db.delete(w)
+
+    db.commit()
+
+    return {
+        "ratings": db.query(func.count(Rating.id)).scalar(),
+        "follows": db.query(func.count(Follow.id)).scalar(),
+        "wishlists": db.query(func.count(Wishlist.id)).scalar(),
     }
