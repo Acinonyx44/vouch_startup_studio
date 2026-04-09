@@ -1,40 +1,10 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import Button from '../components/ui/Button';
 import VouchLogo from '../components/ui/VouchLogo';
 
 const GOOGLE_CLIENT_ID = '745899766698-58m0aqf28p5v5kll7vhc0lbjrnd8rcjr.apps.googleusercontent.com';
-
-function Typewriter({ text, speed = 60 }) {
-  const [displayed, setDisplayed] = useState('');
-  const [done, setDone] = useState(false);
-  const idx = useRef(0);
-
-  useEffect(() => {
-    idx.current = 0;
-    setDisplayed('');
-    setDone(false);
-    const timer = setInterval(() => {
-      idx.current += 1;
-      setDisplayed(text.slice(0, idx.current));
-      if (idx.current >= text.length) {
-        clearInterval(timer);
-        setTimeout(() => setDone(true), 600);
-      }
-    }, speed);
-    return () => clearInterval(timer);
-  }, [text, speed]);
-
-  return (
-    <p className="mt-3 text-text-muted text-sm lg:text-base max-w-[260px] lg:max-w-md mx-auto">
-      {displayed}
-      {!done && (
-        <span className="inline-block w-[2px] h-[1em] bg-terracotta/60 ml-0.5 align-middle animate-pulse" />
-      )}
-    </p>
-  );
-}
 
 /**
  * Login — Auth entry point with email register/login + OAuth buttons.
@@ -139,7 +109,9 @@ export default function Login() {
       {/* Logo / wordmark */}
       <div className="mb-10 text-center">
         <VouchLogo size="lg" />
-        <Typewriter text="Your social life, ranked." />
+        <p className="mt-3 text-text-muted text-sm lg:text-base max-w-[260px] lg:max-w-md mx-auto">
+          Your social life, ranked.
+        </p>
       </div>
 
       {/* Auth buttons */}
