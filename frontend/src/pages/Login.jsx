@@ -170,7 +170,9 @@ export default function Login() {
 
           <button
             onClick={handleInstagram}
-            className="flex items-center justify-center gap-3 w-full py-3 px-4 rounded-full glass-input font-semibold text-sm hover:bg-white/60 transition-fluid"
+            disabled
+            title="Instagram sign-in is coming soon"
+            className="flex items-center justify-center gap-3 w-full py-3 px-4 rounded-full glass-input font-semibold text-sm opacity-50 cursor-not-allowed transition-fluid relative"
           >
             <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none">
               <defs>
@@ -185,6 +187,7 @@ export default function Login() {
               <circle cx="17.5" cy="6.5" r="1.5" fill="url(#ig)" />
             </svg>
             Continue with Instagram
+            <span className="absolute right-3 text-[9px] uppercase tracking-wider text-text-muted font-bold">Soon</span>
           </button>
 
           <div className="flex items-center gap-3 my-1">

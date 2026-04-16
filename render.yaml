@@ -28,6 +28,12 @@ services:
         sync: false
       - key: TICKETMASTER_API_KEY
         sync: false
+      # OAuth: paste from Google Cloud Console → OAuth credentials.
+      # Must match the client ID hardcoded in frontend/src/pages/Login.jsx.
+      # Also add https://vouchnyc.onrender.com to that client's
+      # "Authorized JavaScript origins" before signing in works.
+      - key: GOOGLE_CLIENT_ID
+        sync: false
       # Gate for /users/admin/promote-tastemaker. Used by populate_tastemakers.py
       # during seeding only. Rotate from the Render dashboard after seeding.
       - key: ADMIN_SECRET
