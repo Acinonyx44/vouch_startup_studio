@@ -50,8 +50,8 @@ services:
         source: /*
         destination: /index.html
     envVars:
+      # Hardcoded full public URL — Render's fromService.host returns the
+      # INTERNAL network name (e.g. "vouch-api-5pa4"), not the public
+      # .onrender.com URL, which breaks the static site build.
       - key: VITE_API_URL
-        fromService:
-          name: vouch-api
-          type: web
-          property: host
+        value: https://vouch-api-5pa4.onrender.com

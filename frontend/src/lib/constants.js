@@ -74,7 +74,12 @@ export const NAV_ITEMS = [
 // detection → localhost.
 function _resolveApiBase() {
   const env = import.meta.env.VITE_API_URL;
-  if (env) return env.startsWith('http') ? env : `https://${env}`;
+  // A real URL must contain a dot (rules out Render's internal hostname like
+  // "vouch-api-5pa4" that fromService.host returns — that's an internal
+  // network name, not a public DNS name).
+  if (env && env.includes('.')) {
+    return env.startsWith('http') ? env : `https://${env}`;
+  }
   if (typeof window !== 'undefined') {
     const host = window.location.hostname;
     if (host && !/localhost|127\.0\.0\.1/.test(host)) {
