@@ -21,7 +21,7 @@ services:
         generateValue: true
       - key: FRONTEND_URL
         fromService:
-          name: vouch-web
+          name: vouchnyc
           type: web
           property: host
       - key: GOOGLE_PLACES_API_KEY
@@ -35,7 +35,7 @@ services:
 
   # --- Frontend Static Site ---
   - type: web
-    name: vouch-web
+    name: vouchnyc
     runtime: static
     buildCommand: cd frontend && npm install && npm run build
     staticPublishPath: ./frontend/dist
