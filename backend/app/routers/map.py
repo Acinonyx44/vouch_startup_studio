@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, desc
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user_optional
+from app.auth import get_current_user_optional, get_current_user
 from app.config import settings
 from app.database import get_db
 from app.models.experience import Experience
@@ -63,16 +63,15 @@ _NYC_BBOX = {
 def get_map_pins(
     category: Optional[str] = None,
     layer: Optional[str] = Query(None, description="mine | friends | wishlist | all"),
-    near_lat: Optional[float] = Query(None, description="Latitude of the area to focus on"),
-    near_lng: Optional[float] = Query(None, description="Longitude of the area to focus on"),
-    radius_km: float = Query(2.0, ge=0.1, le=50, description="Radius around (near_lat, near_lng) in km"),
+    lat: Optional[float] = Query(None, description="User latitude for proximity filter"),
+    lng: Optional[float] = Query(None, description="User longitude for proximity filter"),
+    radius_km: float = Query(50.0, description="Radius in km when lat/lng provided"),
     db: Session = Depends(get_db),
     current_user: User | None = Depends(get_current_user_optional),
 ):
     """
     Return experiences that have lat/lng, with their average score.
-    Filterable by category, layer (my ratings, friends', wishlist, or all),
-    and an optional proximity filter (near_lat + near_lng + radius_km).
+    Filterable by category, layer, and proximity (lat/lng/radius_km).
     """
     # Base: experiences with coordinates
     base = (
@@ -89,14 +88,13 @@ def get_map_pins(
     if category:
         base = base.filter(Experience.category == category)
 
-    # Bounding box pre-filter for proximity (cheap; SQL can use indexes if any).
-    # We refine in Python with Haversine for accurate ordering after fetch.
-    if near_lat is not None and near_lng is not None:
-        d_lat = _km_to_deg_lat(radius_km)
-        d_lng = _km_to_deg_lng(radius_km, near_lat)
+    # Proximity filter — bounding box approximation (1° lat ≈ 111 km)
+    if lat is not None and lng is not None:
+        lat_delta = radius_km / 111.0
+        lng_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
         base = base.filter(
-            Experience.latitude.between(near_lat - d_lat, near_lat + d_lat),
-            Experience.longitude.between(near_lng - d_lng, near_lng + d_lng),
+            Experience.latitude.between(lat - lat_delta, lat + lat_delta),
+            Experience.longitude.between(lng - lng_delta, lng + lng_delta),
         )
 
     # Layer filtering (requires auth)
@@ -129,37 +127,23 @@ def get_map_pins(
         )
         base = base.filter(Experience.id.in_(wish_exp_ids))
 
-    rows = base.order_by(desc("avg_score")).limit(400).all()
+    rows = base.order_by(desc("avg_score")).limit(200).all()
 
     pins = []
     for exp, avg_score, num_ratings in rows:
-        # Refine proximity with Haversine + carry distance for ordering.
-        if near_lat is not None and near_lng is not None:
-            dist = _haversine_km(near_lat, near_lng, exp.latitude, exp.longitude)
-            if dist > radius_km:
-                continue
-        pins.append((
-            dist if near_lat is not None and near_lng is not None else None,
-            MapPinOut(
-                id=exp.id,
-                name=exp.name,
-                category=exp.category,
-                latitude=exp.latitude,
-                longitude=exp.longitude,
-                address=exp.address or "",
-                neighborhood=exp.neighborhood or "",
-                cover_photo_url=exp.cover_photo_url or "",
-                avg_score=round(float(avg_score), 1),
-                num_ratings=int(num_ratings),
-            )
+        pins.append(MapPinOut(
+            id=exp.id,
+            name=exp.name,
+            category=exp.category,
+            latitude=exp.latitude,
+            longitude=exp.longitude,
+            address=exp.address or "",
+            neighborhood=exp.neighborhood or "",
+            cover_photo_url=exp.cover_photo_url or "",
+            avg_score=round(float(avg_score), 1),
+            num_ratings=int(num_ratings),
         ))
-
-    # Order: when localized, prefer closest first (distance asc) tie-broken by score.
-    # Otherwise keep original score-desc order from SQL.
-    if near_lat is not None and near_lng is not None:
-        pins.sort(key=lambda t: (t[0] if t[0] is not None else 0, -t[1].avg_score))
-
-    return [p[1] for p in pins[:200]]
+    return pins
 
 
 # ── Locate ────────────────────────────────────────────────────────
@@ -200,14 +184,11 @@ async def locate_area(
         lngs = [r.longitude for r in rows]
         center_lat = sum(lats) / len(lats)
         center_lng = sum(lngs) / len(lngs)
-        # Bbox half-extent in km, with 0.5 km floor so a one-pin neighbourhood
-        # still gets a sensible viewport.
         max_dist = max(
             _haversine_km(center_lat, center_lng, lat, lng)
             for lat, lng in zip(lats, lngs)
         )
         radius_km = max(0.6, min(max_dist + 0.3, 5.0))
-        # Prefer the most common neighborhood label among matches for display.
         labels = [r.neighborhood for r in rows if r.neighborhood]
         label = max(set(labels), key=labels.count) if labels else q.title()
         return LocateResult(
@@ -259,12 +240,10 @@ async def locate_area(
     if lat is None or lng is None:
         raise HTTPException(status_code=502, detail="Geocoder returned no coordinates")
 
-    # Derive radius from viewport when present, else 1.5 km default.
     vp = p.get("viewport") or {}
     low = vp.get("low") or {}
     high = vp.get("high") or {}
     if low and high:
-        # Half-diagonal in km, clamped to [0.6, 5].
         diag = _haversine_km(low["latitude"], low["longitude"], high["latitude"], high["longitude"])
         radius_km = max(0.6, min(diag / 2, 5.0))
     else:
@@ -276,8 +255,6 @@ async def locate_area(
         or q.title()
     )
 
-    # Count how many existing experiences land in the area, so the UI can
-    # warn "0 vouches near Soho — be the first" without a second roundtrip.
     d_lat = _km_to_deg_lat(radius_km)
     d_lng = _km_to_deg_lng(radius_km, lat)
     nearby_count = (

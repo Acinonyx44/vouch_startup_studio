@@ -89,4 +89,7 @@ function _resolveApiBase() {
   return 'http://localhost:8000';
 }
 const _apiBase = _resolveApiBase();
-export const API_BASE_URL = _apiBase.endsWith('/api/v1') ? _apiBase : `${_apiBase.replace(/\/+$/, '')}/api/v1`;
+const _normalizedBase = _apiBase.replace(/\/+$/, '');
+export const API_BASE_URL = _normalizedBase.endsWith('/api/v1')
+  ? _normalizedBase
+  : `${_normalizedBase}/api/v1`;

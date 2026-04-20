@@ -1,41 +1,11 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useEffect, useRef } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import Button from '../components/ui/Button';
 import VouchLogo from '../components/ui/VouchLogo';
 import { trackLoginPageViewed, trackSignupStarted, trackLoginCompleted, trackSignupCompleted } from '../lib/analytics';
 
-const GOOGLE_CLIENT_ID = '745899766698-58m0aqf28p5v5kll7vhc0lbjrnd8rcjr.apps.googleusercontent.com';
-
-function Typewriter({ text, speed = 60 }) {
-  const [displayed, setDisplayed] = useState('');
-  const [done, setDone] = useState(false);
-  const idx = useRef(0);
-
-  useEffect(() => {
-    idx.current = 0;
-    setDisplayed('');
-    setDone(false);
-    const timer = setInterval(() => {
-      idx.current += 1;
-      setDisplayed(text.slice(0, idx.current));
-      if (idx.current >= text.length) {
-        clearInterval(timer);
-        setTimeout(() => setDone(true), 600);
-      }
-    }, speed);
-    return () => clearInterval(timer);
-  }, [text, speed]);
-
-  return (
-    <p className="mt-3 text-text-muted text-sm lg:text-base max-w-[260px] lg:max-w-md mx-auto">
-      {displayed}
-      {!done && (
-        <span className="inline-block w-[2px] h-[1em] bg-terracotta/60 ml-0.5 align-middle animate-pulse" />
-      )}
-    </p>
-  );
-}
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
 
 /**
  * Login — Liquid glass auth page with floating blobs and translucent form.
@@ -43,9 +13,11 @@ function Typewriter({ text, speed = 60 }) {
 export default function Login() {
   const { login, register, loginGoogle, loginInstagram } = useAuth();
   const navigate = useNavigate();
+  const routeLocation = useLocation();
   const googleInitialized = useRef(false);
 
-  const [mode, setMode] = useState('login');
+  const initialMode = routeLocation.state?.mode === 'register' ? 'register' : 'login';
+  const [mode, setMode] = useState(initialMode);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [username, setUsername] = useState('');
@@ -56,8 +28,39 @@ export default function Login() {
   // Track login page view
   useEffect(() => { trackLoginPageViewed(); }, []);
 
+  // Typewriter effect for the tagline.
+  const TAGLINE_PREFIX = 'Your social life, ';
+  const TAGLINE_SUFFIX = 'ranked.';
+  const FULL_LEN = TAGLINE_PREFIX.length + TAGLINE_SUFFIX.length;
+  const [typedLen, setTypedLen] = useState(0);
+  useEffect(() => {
+    setTypedLen(0);
+    const startDelay = setTimeout(() => {
+      let i = 0;
+      const interval = setInterval(() => {
+        i += 1;
+        setTypedLen(i);
+        if (i >= FULL_LEN) clearInterval(interval);
+      }, 55);
+      // Stash on window so the next-layer cleanup can clear it even after unmount.
+      return () => clearInterval(interval);
+    }, 350);
+    return () => clearTimeout(startDelay);
+  }, [FULL_LEN]);
+
+  const typedPrefix = TAGLINE_PREFIX.slice(0, Math.min(typedLen, TAGLINE_PREFIX.length));
+  const typedSuffix = typedLen > TAGLINE_PREFIX.length
+    ? TAGLINE_SUFFIX.slice(0, typedLen - TAGLINE_PREFIX.length)
+    : '';
+  const typingDone = typedLen >= FULL_LEN;
+
   useEffect(() => {
     if (googleInitialized.current) return;
+
+    if (!GOOGLE_CLIENT_ID) {
+      setError('Google Sign-In is not configured. Set VITE_GOOGLE_CLIENT_ID.');
+      return;
+    }
 
     const initGoogle = () => {
       if (!window.google?.accounts?.id) return;
@@ -147,8 +150,17 @@ export default function Login() {
 
       {/* Logo / wordmark */}
       <div className="mb-8 text-center relative z-10">
-        <VouchLogo size="lg" />
-        <Typewriter text="Your social life, ranked." />
+        <div className="animate-fade-up">
+          <VouchLogo size="lg" />
+        </div>
+        <p className="mt-3 text-text-muted text-sm lg:text-base max-w-[260px] lg:max-w-md mx-auto min-h-[1.4em]">
+          {typedPrefix}
+          <em className="italic text-terracotta not-italic-placeholder" style={{ fontStyle: 'italic' }}>{typedSuffix}</em>
+          <span
+            aria-hidden="true"
+            className={`inline-block w-[2px] h-[1em] align-[-2px] ml-0.5 bg-terracotta ${typingDone ? 'animate-pulse' : ''}`}
+          />
+        </p>
       </div>
 
       {/* Auth form — glass card */}
