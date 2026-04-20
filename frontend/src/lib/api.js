@@ -117,15 +117,6 @@ export const api = {
 
   // ===== LISTS =====
   lists: {
-    create: (data) => request('/lists', { method: 'POST', body: JSON.stringify(data) }),
-    get: (listId) => request(`/lists/${listId}`),
-    update: (listId, data) => request(`/lists/${listId}`, { method: 'PATCH', body: JSON.stringify(data) }),
-    delete: (listId) => request(`/lists/${listId}`, { method: 'DELETE' }),
-    getForUser: (userId) => request(`/users/${userId}/lists`),
-  },
-
-  // ===== LISTS =====
-  lists: {
     getMine: () => request('/lists/'),
     getForUser: (userId) => request(`/lists/user/${userId}`),
     get: (listId) => request(`/lists/${listId}`),
