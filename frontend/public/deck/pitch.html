@@ -1,0 +1,1656 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Vouch — Pitch Deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>
+/**
+ * <deck-stage> — reusable web component for HTML decks.
+ *
+ * Handles:
+ *  (a) speaker notes — reads <script type="application/json" id="speaker-notes">
+ *      and posts {slideIndexChanged: N} to the parent window on nav.
+ *  (b) keyboard navigation — ←/→, PgUp/PgDn, Space, Home/End, number keys.
+ *  (c) press R to reset to slide 0 (with a tasteful keyboard hint).
+ *  (d) bottom-center overlay showing slide count + hints, fades out on idle.
+ *  (e) auto-scaling — inner canvas is a fixed design size (default 1920×1080)
+ *      scaled with `transform: scale()` to fit the viewport, letterboxed.
+ *      Set the `noscale` attribute to render at authored size (1:1) — the
+ *      PPTX exporter sets this so its DOM capture sees unscaled geometry.
+ *  (f) print — `@media print` lays every slide out as its own page at the
+ *      design size, so the browser's Print → Save as PDF produces a clean
+ *      one-page-per-slide PDF with no extra setup.
+ *
+ * Slides are HIDDEN, not unmounted. Non-active slides stay in the DOM with
+ * `visibility: hidden` + `opacity: 0`, so their state (videos, iframes,
+ * form inputs, React trees) is preserved across navigation.
+ *
+ * Lifecycle event — the component dispatches a `slidechange` CustomEvent on
+ * itself whenever the active slide changes (including the initial mount).
+ * The event bubbles and composes out of shadow DOM, so you can listen on
+ * the <deck-stage> element or on document:
+ *
+ *   document.querySelector('deck-stage').addEventListener('slidechange', (e) => {
+ *     e.detail.index         // new 0-based index
+ *     e.detail.previousIndex // previous index, or -1 on init
+ *     e.detail.total         // total slide count
+ *     e.detail.slide         // the new active slide element
+ *     e.detail.previousSlide // the prior slide element, or null on init
+ *     e.detail.reason        // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+ *   });
+ *
+ * Persistence: current slide index is saved to localStorage keyed by the
+ * document path, so refresh returns you to the same place.
+ *
+ * Usage:
+ *   <deck-stage width="1920" height="1080">
+ *     <section data-label="Title">...</section>
+ *     <section data-label="Agenda">...</section>
+ *   </deck-stage>
+ *
+ * Slides are the direct element children of <deck-stage>. Each slide is
+ * automatically tagged with:
+ *   - data-screen-label="NN Label"   (1-indexed, for comment flow)
+ *   - data-om-validate="no_overflowing_text,no_overlapping_text,slide_sized_text"
+ */
+
+(() => {
+  const DESIGN_W_DEFAULT = 1920;
+  const DESIGN_H_DEFAULT = 1080;
+  const STORAGE_PREFIX = 'deck-stage:slide:';
+  const OVERLAY_HIDE_MS = 1800;
+  const VALIDATE_ATTR = 'no_overflowing_text,no_overlapping_text,slide_sized_text';
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+
+  const stylesheet = `
+    :host {
+      position: fixed;
+      inset: 0;
+      display: block;
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    .stage {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .canvas {
+      position: relative;
+      transform-origin: center center;
+      flex-shrink: 0;
+      background: #fff;
+      will-change: transform;
+    }
+
+    /* Slides live in light DOM (via <slot>) so authored CSS still applies.
+       We absolutely position each slotted child to stack them. */
+    ::slotted(*) {
+      position: absolute !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      box-sizing: border-box !important;
+      overflow: hidden;
+      opacity: 0;
+      pointer-events: none;
+      visibility: hidden;
+    }
+    ::slotted([data-deck-active]) {
+      opacity: 1;
+      pointer-events: auto;
+      visibility: visible;
+    }
+
+    /* Tap zones for mobile — back/forward thirds like Stories.
+       Transparent, no visible UI, don't block the overlay. */
+    .tapzones {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      z-index: 2147482000;
+      pointer-events: none;
+    }
+    .tapzone {
+      flex: 1;
+      pointer-events: auto;
+      -webkit-tap-highlight-color: transparent;
+    }
+    /* Only activate tap zones on coarse pointers (touch devices). */
+    @media (hover: hover) and (pointer: fine) {
+      .tapzones { display: none; }
+    }
+
+    .overlay {
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      transform: translate(-50%, 6px) scale(0.92);
+      filter: blur(6px);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px;
+      background: #000;
+      color: #fff;
+      border-radius: 999px;
+      font-size: 12px;
+      font-feature-settings: "tnum" 1;
+      letter-spacing: 0.01em;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 260ms ease, transform 260ms cubic-bezier(.2,.8,.2,1), filter 260ms ease;
+      transform-origin: center bottom;
+      z-index: 2147483000;
+      user-select: none;
+    }
+    .overlay[data-visible] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translate(-50%, 0) scale(1);
+      filter: blur(0);
+    }
+
+    .btn {
+      appearance: none;
+      -webkit-appearance: none;
+      background: transparent;
+      border: 0;
+      margin: 0;
+      padding: 0;
+      color: inherit;
+      font: inherit;
+      cursor: default;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 28px;
+      min-width: 28px;
+      border-radius: 999px;
+      color: rgba(255,255,255,0.72);
+      transition: background 140ms ease, color 140ms ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+    .btn:active { background: rgba(255,255,255,0.18); }
+    .btn:focus { outline: none; }
+    .btn:focus-visible { outline: none; }
+    .btn::-moz-focus-inner { border: 0; }
+    .btn svg { width: 14px; height: 14px; display: block; }
+    .btn.reset {
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      padding: 0 10px 0 12px;
+      gap: 6px;
+      color: rgba(255,255,255,0.72);
+    }
+    .btn.reset .kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 16px;
+      height: 16px;
+      padding: 0 4px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 10px;
+      line-height: 1;
+      color: rgba(255,255,255,0.88);
+      background: rgba(255,255,255,0.12);
+      border-radius: 4px;
+    }
+
+    .count {
+      font-variant-numeric: tabular-nums;
+      color: #fff;
+      font-weight: 500;
+      padding: 0 8px;
+      min-width: 42px;
+      text-align: center;
+      font-size: 12px;
+    }
+    .count .sep { color: rgba(255,255,255,0.45); margin: 0 3px; font-weight: 400; }
+    .count .total { color: rgba(255,255,255,0.55); }
+
+    .divider {
+      width: 1px;
+      height: 14px;
+      background: rgba(255,255,255,0.18);
+      margin: 0 2px;
+    }
+
+    /* ── Print: one page per slide, no chrome ────────────────────────────
+       The screen layout stacks every slide at inset:0 inside a scaled
+       canvas; for print we want them in document flow at the authored
+       design size so the browser paginates one slide per sheet. The
+       @page size is set from the width/height attributes via the inline
+       <style id="deck-stage-print-page"> that connectedCallback injects
+       into <head> (the @page at-rule has no effect inside shadow DOM). */
+    @media print {
+      :host {
+        position: static;
+        inset: auto;
+        background: none;
+        overflow: visible;
+        color: inherit;
+      }
+      .stage { position: static; display: block; }
+      .canvas {
+        transform: none !important;
+        width: auto !important;
+        height: auto !important;
+        background: none;
+        will-change: auto;
+      }
+      ::slotted(*) {
+        position: relative !important;
+        inset: auto !important;
+        width: var(--deck-design-w) !important;
+        height: var(--deck-design-h) !important;
+        box-sizing: border-box !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+        pointer-events: auto;
+        break-after: page;
+        page-break-after: always;
+        break-inside: avoid;
+        overflow: hidden;
+      }
+      ::slotted(*:last-child) {
+        break-after: auto;
+        page-break-after: auto;
+      }
+      .overlay, .tapzones { display: none !important; }
+    }
+  `;
+
+  class DeckStage extends HTMLElement {
+    static get observedAttributes() { return ['width', 'height', 'noscale']; }
+
+    constructor() {
+      super();
+      this._root = this.attachShadow({ mode: 'open' });
+      this._index = 0;
+      this._slides = [];
+      this._notes = [];
+      this._hideTimer = null;
+      this._mouseIdleTimer = null;
+      this._storageKey = STORAGE_PREFIX + (location.pathname || '/');
+
+      this._onKey = this._onKey.bind(this);
+      this._onResize = this._onResize.bind(this);
+      this._onSlotChange = this._onSlotChange.bind(this);
+      this._onMouseMove = this._onMouseMove.bind(this);
+      this._onTapBack = this._onTapBack.bind(this);
+      this._onTapForward = this._onTapForward.bind(this);
+    }
+
+    get designWidth() {
+      return parseInt(this.getAttribute('width'), 10) || DESIGN_W_DEFAULT;
+    }
+    get designHeight() {
+      return parseInt(this.getAttribute('height'), 10) || DESIGN_H_DEFAULT;
+    }
+
+    connectedCallback() {
+      this._render();
+      this._loadNotes();
+      this._syncPrintPageRule();
+      window.addEventListener('keydown', this._onKey);
+      window.addEventListener('resize', this._onResize);
+      window.addEventListener('mousemove', this._onMouseMove, { passive: true });
+      // Initial collection + layout happens via slotchange, which fires on mount.
+    }
+
+    disconnectedCallback() {
+      window.removeEventListener('keydown', this._onKey);
+      window.removeEventListener('resize', this._onResize);
+      window.removeEventListener('mousemove', this._onMouseMove);
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      if (this._mouseIdleTimer) clearTimeout(this._mouseIdleTimer);
+    }
+
+    attributeChangedCallback() {
+      if (this._canvas) {
+        this._canvas.style.width = this.designWidth + 'px';
+        this._canvas.style.height = this.designHeight + 'px';
+        this._canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+        this._canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+        this._fit();
+        this._syncPrintPageRule();
+      }
+    }
+
+    _render() {
+      const style = document.createElement('style');
+      style.textContent = stylesheet;
+
+      const stage = document.createElement('div');
+      stage.className = 'stage';
+
+      const canvas = document.createElement('div');
+      canvas.className = 'canvas';
+      canvas.style.width = this.designWidth + 'px';
+      canvas.style.height = this.designHeight + 'px';
+      canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+      canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+
+      const slot = document.createElement('slot');
+      slot.addEventListener('slotchange', this._onSlotChange);
+      canvas.appendChild(slot);
+      stage.appendChild(canvas);
+
+      // Tap zones (mobile): left third = back, right third = forward.
+      const tapzones = document.createElement('div');
+      tapzones.className = 'tapzones export-hidden';
+      tapzones.setAttribute('aria-hidden', 'true');
+      const tzBack = document.createElement('div');
+      tzBack.className = 'tapzone tapzone--back';
+      const tzMid = document.createElement('div');
+      tzMid.className = 'tapzone tapzone--mid';
+      tzMid.style.pointerEvents = 'none';
+      const tzFwd = document.createElement('div');
+      tzFwd.className = 'tapzone tapzone--fwd';
+      tzBack.addEventListener('click', this._onTapBack);
+      tzFwd.addEventListener('click', this._onTapForward);
+      tapzones.append(tzBack, tzMid, tzFwd);
+
+      // Overlay: compact, solid black, with clickable controls.
+      const overlay = document.createElement('div');
+      overlay.className = 'overlay export-hidden';
+      overlay.setAttribute('role', 'toolbar');
+      overlay.setAttribute('aria-label', 'Deck controls');
+      overlay.innerHTML = `
+        <button class="btn prev" type="button" aria-label="Previous slide" title="Previous (←)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3L5 8l5 5"/></svg>
+        </button>
+        <span class="count" aria-live="polite"><span class="current">1</span><span class="sep">/</span><span class="total">1</span></span>
+        <button class="btn next" type="button" aria-label="Next slide" title="Next (→)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>
+        </button>
+        <span class="divider"></span>
+        <button class="btn reset" type="button" aria-label="Reset to first slide" title="Reset (R)">Reset<span class="kbd">R</span></button>
+      `;
+
+      overlay.querySelector('.prev').addEventListener('click', () => this._go(this._index - 1, 'click'));
+      overlay.querySelector('.next').addEventListener('click', () => this._go(this._index + 1, 'click'));
+      overlay.querySelector('.reset').addEventListener('click', () => this._go(0, 'click'));
+
+      this._root.append(style, stage, tapzones, overlay);
+      this._canvas = canvas;
+      this._slot = slot;
+      this._overlay = overlay;
+      this._countEl = overlay.querySelector('.current');
+      this._totalEl = overlay.querySelector('.total');
+    }
+
+    /** @page must live in the document stylesheet — it's a no-op inside
+     *  shadow DOM. Inject/update a single <head> style tag so the print
+     *  sheet matches the design size and Save-as-PDF yields one slide per
+     *  page with no margins. */
+    _syncPrintPageRule() {
+      const id = 'deck-stage-print-page';
+      let tag = document.getElementById(id);
+      if (!tag) {
+        tag = document.createElement('style');
+        tag.id = id;
+        document.head.appendChild(tag);
+      }
+      tag.textContent =
+        '@page { size: ' + this.designWidth + 'px ' + this.designHeight + 'px; margin: 0; } ' +
+        '@media print { html, body { margin: 0 !important; padding: 0 !important; background: none !important; overflow: visible !important; height: auto !important; } ' +
+        '* { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }';
+    }
+
+    _onSlotChange() {
+      this._collectSlides();
+      this._restoreIndex();
+      this._applyIndex({ showOverlay: false, broadcast: true, reason: 'init' });
+      this._fit();
+    }
+
+    _collectSlides() {
+      const assigned = this._slot.assignedElements({ flatten: true });
+      this._slides = assigned.filter((el) => {
+        // Skip template/style/script nodes even if someone slots them.
+        const tag = el.tagName;
+        return tag !== 'TEMPLATE' && tag !== 'SCRIPT' && tag !== 'STYLE';
+      });
+
+      this._slides.forEach((slide, i) => {
+        const n = i + 1;
+        // Determine a label for comment flow: prefer explicit data-label,
+        // then an existing data-screen-label, then first heading, else "Slide".
+        let label = slide.getAttribute('data-label');
+        if (!label) {
+          const existing = slide.getAttribute('data-screen-label');
+          if (existing) {
+            // Strip any leading number the author may have included.
+            label = existing.replace(/^\s*\d+\s*/, '').trim() || existing;
+          }
+        }
+        if (!label) {
+          const h = slide.querySelector('h1, h2, h3, [data-title]');
+          if (h) label = (h.textContent || '').trim().slice(0, 40);
+        }
+        if (!label) label = 'Slide';
+        slide.setAttribute('data-screen-label', `${pad2(n)} ${label}`);
+
+        // Validation attribute for comment flow / auto-checks.
+        if (!slide.hasAttribute('data-om-validate')) {
+          slide.setAttribute('data-om-validate', VALIDATE_ATTR);
+        }
+
+        slide.setAttribute('data-deck-slide', String(i));
+      });
+
+      if (this._totalEl) this._totalEl.textContent = String(this._slides.length || 1);
+      if (this._index >= this._slides.length) this._index = Math.max(0, this._slides.length - 1);
+    }
+
+    _loadNotes() {
+      const tag = document.getElementById('speaker-notes');
+      if (!tag) { this._notes = []; return; }
+      try {
+        const parsed = JSON.parse(tag.textContent || '[]');
+        if (Array.isArray(parsed)) this._notes = parsed;
+      } catch (e) {
+        console.warn('[deck-stage] Failed to parse #speaker-notes JSON:', e);
+        this._notes = [];
+      }
+    }
+
+    _restoreIndex() {
+      try {
+        const raw = localStorage.getItem(this._storageKey);
+        if (raw != null) {
+          const n = parseInt(raw, 10);
+          if (Number.isFinite(n) && n >= 0 && n < this._slides.length) {
+            this._index = n;
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    _persistIndex() {
+      try { localStorage.setItem(this._storageKey, String(this._index)); }
+      catch (e) { /* ignore */ }
+    }
+
+    _applyIndex({ showOverlay = true, broadcast = true, reason = 'init' } = {}) {
+      if (!this._slides.length) return;
+      const prev = this._prevIndex == null ? -1 : this._prevIndex;
+      const curr = this._index;
+      this._slides.forEach((s, i) => {
+        if (i === curr) s.setAttribute('data-deck-active', '');
+        else s.removeAttribute('data-deck-active');
+      });
+      if (this._countEl) this._countEl.textContent = String(curr + 1);
+      this._persistIndex();
+
+      if (broadcast) {
+        // (1) Legacy: host-window postMessage for speaker-notes renderers.
+        try { window.postMessage({ slideIndexChanged: curr }, '*'); } catch (e) {}
+
+        // (2) In-page CustomEvent on the <deck-stage> element itself.
+        //     Bubbles and composes out of shadow DOM so slide code can listen:
+        //       document.querySelector('deck-stage').addEventListener('slidechange', e => {
+        //         e.detail.index, e.detail.previousIndex, e.detail.total, e.detail.slide, e.detail.reason
+        //       });
+        const detail = {
+          index: curr,
+          previousIndex: prev,
+          total: this._slides.length,
+          slide: this._slides[curr] || null,
+          previousSlide: prev >= 0 ? (this._slides[prev] || null) : null,
+          reason: reason, // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+        };
+        this.dispatchEvent(new CustomEvent('slidechange', {
+          detail,
+          bubbles: true,
+          composed: true,
+        }));
+      }
+
+      this._prevIndex = curr;
+      if (showOverlay) this._flashOverlay();
+    }
+
+    _flashOverlay() {
+      if (!this._overlay) return;
+      this._overlay.setAttribute('data-visible', '');
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      this._hideTimer = setTimeout(() => {
+        this._overlay.removeAttribute('data-visible');
+      }, OVERLAY_HIDE_MS);
+    }
+
+    _fit() {
+      if (!this._canvas) return;
+      // PPTX export sets noscale so the DOM capture sees authored-size
+      // geometry — the scaled canvas is in shadow DOM, so the exporter's
+      // resetTransformSelector can't reach .canvas.style.transform directly.
+      if (this.hasAttribute('noscale')) {
+        this._canvas.style.transform = 'none';
+        return;
+      }
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const s = Math.min(vw / this.designWidth, vh / this.designHeight);
+      this._canvas.style.transform = `scale(${s})`;
+    }
+
+    _onResize() { this._fit(); }
+
+    _onMouseMove() {
+      // Keep overlay visible while mouse moves; hide after idle.
+      this._flashOverlay();
+    }
+
+    _onTapBack(e) {
+      e.preventDefault();
+      this._go(this._index - 1, 'tap');
+    }
+
+    _onTapForward(e) {
+      e.preventDefault();
+      this._go(this._index + 1, 'tap');
+    }
+
+    _onKey(e) {
+      // Ignore when the user is typing.
+      const t = e.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const key = e.key;
+      let handled = true;
+
+      if (key === 'ArrowRight' || key === 'PageDown' || key === ' ' || key === 'Spacebar') {
+        this._go(this._index + 1, 'keyboard');
+      } else if (key === 'ArrowLeft' || key === 'PageUp') {
+        this._go(this._index - 1, 'keyboard');
+      } else if (key === 'Home') {
+        this._go(0, 'keyboard');
+      } else if (key === 'End') {
+        this._go(this._slides.length - 1, 'keyboard');
+      } else if (key === 'r' || key === 'R') {
+        this._go(0, 'keyboard');
+      } else if (/^[0-9]$/.test(key)) {
+        // 1..9 jump to that slide; 0 jumps to 10.
+        const n = key === '0' ? 9 : parseInt(key, 10) - 1;
+        if (n < this._slides.length) this._go(n, 'keyboard');
+      } else {
+        handled = false;
+      }
+
+      if (handled) {
+        e.preventDefault();
+        this._flashOverlay();
+      }
+    }
+
+    _go(i, reason = 'api') {
+      if (!this._slides.length) return;
+      const clamped = Math.max(0, Math.min(this._slides.length - 1, i));
+      if (clamped === this._index) {
+        this._flashOverlay();
+        return;
+      }
+      this._index = clamped;
+      this._applyIndex({ showOverlay: true, broadcast: true, reason });
+    }
+
+    // Public API ------------------------------------------------------------
+
+    /** Current slide index (0-based). */
+    get index() { return this._index; }
+    /** Total slide count. */
+    get length() { return this._slides.length; }
+    /** Programmatically navigate. */
+    goTo(i) { this._go(i, 'api'); }
+    next() { this._go(this._index + 1, 'api'); }
+    prev() { this._go(this._index - 1, 'api'); }
+    reset() { this._go(0, 'api'); }
+  }
+
+  if (!customElements.get('deck-stage')) {
+    customElements.define('deck-stage', DeckStage);
+  }
+})();
+
+</script>
+<style>
+  :root {
+    --cream:        #faf7f2;
+    --cream-deep:   #f3ede4;
+    --warm-white:   #fefcf9;
+    --charcoal:     #1a1714;
+    --charcoal-soft:#2d2926;
+    --text-body:    #4a4541;
+    --text-muted:   #8a8480;
+    --terracotta:   #c2653a;
+    --terracotta-l: #e8a882;
+    --amber:        #d4943a;
+    --sage:         #7a8c72;
+    --sage-light:   #e8ede5;
+    --stone:        #d6cfc5;
+    --stone-light:  #eae6df;
+
+    --serif: "Libre Baskerville", Georgia, serif;
+    --sans:  "Outfit", system-ui, -apple-system, sans-serif;
+    --mono:  "JetBrains Mono", ui-monospace, monospace;
+  }
+
+  html, body { margin: 0; padding: 0; background: #000; }
+
+  /* Slide frame defaults */
+  .slide {
+    font-family: var(--sans);
+    color: var(--text-body);
+    background: var(--cream);
+    position: relative;
+  }
+  .slide.bg-deep     { background: var(--cream-deep); }
+  .slide.bg-charcoal { background: var(--charcoal); color: var(--cream); }
+  .slide.bg-white    { background: var(--warm-white); }
+
+  /* Subtle grain on every slide */
+  .slide::before {
+    content: "";
+    position: absolute; inset: 0;
+    pointer-events: none;
+    opacity: 0.025;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 256px;
+    z-index: 0;
+  }
+  .slide > * { position: relative; z-index: 1; }
+
+  /* Typography */
+  .display { font-family: var(--serif); font-weight: 400; color: var(--charcoal); letter-spacing: -0.01em; line-height: 1.08; }
+  .bg-charcoal .display { color: var(--cream); }
+  em.accent { font-style: italic; color: var(--terracotta); font-weight: 400; }
+  .bg-charcoal em.accent { color: var(--terracotta-l); }
+
+  .eyebrow {
+    font-family: var(--sans);
+    font-size: 20px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    color: var(--terracotta);
+  }
+  .bg-charcoal .eyebrow { color: var(--terracotta-l); }
+
+  .body-lg { font-family: var(--sans); font-size: 34px; line-height: 1.55; color: var(--text-body); font-weight: 400; }
+  .bg-charcoal .body-lg { color: var(--stone); }
+  .body-md { font-family: var(--sans); font-size: 28px; line-height: 1.55; color: var(--text-body); }
+  .bg-charcoal .body-md { color: var(--stone); }
+  .caption { font-family: var(--sans); font-size: 24px; color: var(--text-muted); }
+
+  .mono { font-family: var(--mono); }
+
+  /* Layout shell — EVERY slide gets this padding */
+  .frame {
+    position: absolute; inset: 0;
+    padding: 100px 120px 80px 120px;
+    box-sizing: border-box;
+    display: flex; flex-direction: column;
+  }
+
+  /* Logo / footer chrome */
+  .chrome {
+    position: absolute;
+    left: 120px; bottom: 56px;
+    display: flex; align-items: center; gap: 24px;
+    font-size: 20px; color: var(--text-muted);
+  }
+  .chrome .wordmark {
+    font-family: var(--serif); font-weight: 700; color: var(--charcoal);
+    font-size: 22px; letter-spacing: -0.01em;
+  }
+  .bg-charcoal .chrome .wordmark { color: var(--cream); }
+  .chrome .wordmark .dot { color: var(--terracotta); }
+  .chrome .sep { width: 24px; height: 1px; background: var(--stone); }
+  .bg-charcoal .chrome .sep { background: rgba(255,255,255,0.18); }
+
+  .page-num {
+    position: absolute; right: 120px; bottom: 56px;
+    font-family: var(--mono); font-size: 18px; color: var(--text-muted);
+    letter-spacing: 0.04em;
+  }
+
+  /* Score color classes */
+  .score-high { color: var(--sage); }
+  .score-good { color: var(--amber); }
+  .score-mid  { color: var(--text-muted); }
+  .score-low  { color: var(--terracotta); }
+
+  /* Glass card */
+  .glass {
+    background: rgba(254, 252, 249, 0.6);
+    backdrop-filter: blur(20px) saturate(1.4);
+    border: 1px solid rgba(255,255,255,0.55);
+    box-shadow:
+      0 2px 16px rgba(26,23,20,0.05),
+      inset 0 1px 0 rgba(255,255,255,0.7);
+    border-radius: 20px;
+  }
+  .bg-charcoal .glass {
+    background: rgba(255,255,255,0.06);
+    border-color: rgba(255,255,255,0.1);
+    box-shadow: none;
+  }
+
+  /* Phone mockup — scaled up for slide legibility */
+  .phone {
+    width: 420px; height: 860px;
+    background: var(--charcoal);
+    border-radius: 56px;
+    padding: 16px;
+    box-shadow:
+      0 30px 80px rgba(26,23,20,0.22),
+      0 0 0 1px rgba(255,255,255,0.08) inset;
+    position: relative;
+    box-sizing: border-box;
+  }
+  .phone .notch {
+    width: 170px; height: 36px;
+    background: var(--charcoal);
+    border-radius: 0 0 18px 18px;
+    position: absolute;
+    top: 16px; left: 50%; transform: translateX(-50%);
+    z-index: 2;
+  }
+  .phone .screen {
+    width: 100%; height: 100%;
+    background: var(--warm-white);
+    border-radius: 42px;
+    overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+
+  /* Experience row in phone */
+  .exp-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px;
+    background: var(--cream);
+    border-radius: 14px;
+    margin-bottom: 10px;
+  }
+  .exp-row .left { display: flex; align-items: center; gap: 14px; }
+  .exp-row .thumb {
+    width: 46px; height: 46px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+  }
+  .exp-row .name { font-weight: 600; color: var(--charcoal); font-size: 16px; }
+  .exp-row .meta { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+  .exp-row .score {
+    font-family: var(--sans); font-weight: 700; font-size: 28px;
+    line-height: 1;
+  }
+
+  /* Blob decorations */
+  .blob {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(100px);
+    opacity: 0.4;
+    pointer-events: none;
+    z-index: 0;
+  }
+  .blob.t { background: var(--terracotta); }
+  .blob.s { background: var(--sage); }
+  .blob.a { background: var(--amber); }
+
+  /* Table */
+  table.compete {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--sans);
+  }
+  table.compete th, table.compete td {
+    text-align: left;
+    padding: 26px 22px;
+    border-bottom: 1px solid var(--stone-light);
+    font-size: 26px;
+    color: var(--text-body);
+    vertical-align: middle;
+  }
+  table.compete thead th {
+    font-size: 18px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--stone);
+    padding: 16px 22px;
+  }
+  table.compete tbody td:first-child {
+    font-family: var(--serif);
+    font-size: 30px;
+    color: var(--charcoal);
+    font-weight: 400;
+  }
+  table.compete tbody tr.us td {
+    background: rgba(194, 101, 58, 0.06);
+    color: var(--charcoal);
+  }
+  table.compete tbody tr.us td:first-child {
+    color: var(--terracotta);
+    font-weight: 700;
+  }
+  table.compete .check { color: var(--sage); font-weight: 600; }
+  table.compete .cross { color: var(--text-muted); }
+
+  /* Quote */
+  .pullquote {
+    font-family: var(--serif);
+    font-style: italic;
+    line-height: 1.25;
+    color: var(--charcoal);
+  }
+  .bg-charcoal .pullquote { color: var(--cream); }
+
+  /* Step numbers */
+  .step-num {
+    font-family: var(--serif);
+    font-weight: 700;
+    color: var(--stone);
+    font-size: 96px;
+    line-height: 0.9;
+  }
+  .bg-charcoal .step-num { color: rgba(255,255,255,0.18); }
+
+  /* Metric */
+  .metric-huge {
+    font-family: var(--serif);
+    font-weight: 700;
+    font-size: 180px;
+    line-height: 0.95;
+    letter-spacing: -0.02em;
+    color: var(--charcoal);
+  }
+  .bg-charcoal .metric-huge { color: var(--cream); }
+  .metric-huge em { font-style: italic; color: var(--terracotta); }
+
+  /* Image placeholder (striped) */
+  .placeholder {
+    background-image: repeating-linear-gradient(
+      135deg,
+      var(--stone-light) 0, var(--stone-light) 14px,
+      var(--cream-deep) 14px, var(--cream-deep) 28px
+    );
+    border: 1px solid var(--stone);
+    border-radius: 16px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-muted);
+    font-family: var(--mono);
+    font-size: 18px;
+    text-align: center;
+  }
+
+  /* Utility */
+  .rule { height: 1px; background: var(--stone); width: 100%; }
+  .bg-charcoal .rule { background: rgba(255,255,255,0.14); }
+</style>
+</head>
+<body>
+
+<deck-stage width="1920" height="1080">
+
+  <!-- 1. COVER ─────────────────────────────────────────────────────── -->
+  <section class="slide" data-label="Cover">
+    <div class="blob t" style="width: 700px; height: 700px; left: -200px; bottom: -200px;"></div>
+    <div class="blob s" style="width: 560px; height: 560px; right: -160px; top: -160px;"></div>
+
+    <div class="frame" style="justify-content: center; align-items: flex-start;">
+      <div style="font-family: var(--serif); font-weight: 700; font-size: 44px; color: var(--charcoal); letter-spacing: -0.01em;">
+        Vouch<span style="color: var(--terracotta);">.</span>
+      </div>
+      <div class="display" style="font-size: 200px; margin-top: 56px;">
+        Your social life,<br/><em class="accent">ranked.</em>
+      </div>
+      <div class="body-md" style="margin-top: 72px; max-width: 900px;">
+        Demo Day · April 2026
+      </div>
+    </div>
+
+    <div class="page-num">01 / 16</div>
+  </section>
+
+  <!-- 2. HOOK ──────────────────────────────────────────────────────── -->
+  <section class="slide bg-deep" data-label="Hook">
+    <div class="frame" style="justify-content: center;">
+      <div class="eyebrow" style="margin-bottom: 36px;">The pitch in one line</div>
+      <div class="display" style="font-size: 108px; max-width: 1500px;">
+        Rate every place you go.<br/>
+        Get recs from friends <em class="accent">you actually trust.</em>
+      </div>
+      <div class="body-lg" style="margin-top: 52px; max-width: 1100px;">
+        A living record of your taste — searchable, rankable, shareable. Built on one-tap ratings instead of reviews nobody writes.
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Demo Day 2026</span>
+    </div>
+    <div class="page-num">02 / 16</div>
+  </section>
+
+  <!-- 3. PROBLEM ───────────────────────────────────────────────────── -->
+  <section class="slide" data-label="Problem">
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">The problem</div>
+      <div class="display" style="font-size: 96px; max-width: 1400px;">
+        You've been to hundreds of places.<br/>
+        You remember <em class="accent">twenty.</em>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 32px; margin-top: auto;">
+        <div class="glass" style="padding: 40px;">
+          <div class="mono" style="font-size: 16px; color: var(--terracotta); letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 16px;">Notes.app</div>
+          <div class="body-md" style="color: var(--charcoal);">A graveyard of half-typed restaurant names.</div>
+        </div>
+        <div class="glass" style="padding: 40px;">
+          <div class="mono" style="font-size: 16px; color: var(--terracotta); letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 16px;">Google Maps</div>
+          <div class="body-md" style="color: var(--charcoal);">A wall of pins. No context. No ranking.</div>
+        </div>
+        <div class="glass" style="padding: 40px;">
+          <div class="mono" style="font-size: 16px; color: var(--terracotta); letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 16px;">Group chat</div>
+          <div class="body-md" style="color: var(--charcoal);">"Where should we eat?" Mind goes blank.</div>
+        </div>
+      </div>
+
+      <div class="pullquote" style="font-size: 36px; margin-top: 56px; padding-left: 24px; border-left: 3px solid var(--terracotta);">
+        Your taste deserves better than this.
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Problem</span>
+    </div>
+    <div class="page-num">03 / 16</div>
+  </section>
+
+  <!-- 4. SOLUTION ──────────────────────────────────────────────────── -->
+  <section class="slide bg-charcoal" data-label="Solution">
+    <div class="blob t" style="width: 600px; height: 600px; right: -200px; top: -150px; opacity: 0.25;"></div>
+
+    <div class="frame" style="display: grid; grid-template-columns: 1fr 1fr; gap: 80px; align-items: center;">
+      <div>
+        <div class="eyebrow" style="margin-bottom: 32px;">The solution</div>
+        <div class="display" style="font-size: 120px;">
+          One tap.<br/><em class="accent">That's it.</em>
+        </div>
+        <div class="body-lg" style="margin-top: 40px; max-width: 720px;">
+          No review. No paragraph. No photo required. After any experience, rate it 0–10. Vouch builds a living record of your taste over time.
+        </div>
+
+        <div style="display: flex; gap: 20px; margin-top: 56px;">
+          <div style="flex: 1; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 28px 24px;">
+            <div style="font-family: var(--sans); font-weight: 700; font-size: 52px; color: var(--sage); line-height: 1;">8/10</div>
+            <div style="color: var(--stone); font-size: 18px; margin-top: 10px;">Your Thai place</div>
+            <div style="display: inline-block; margin-top: 12px; padding: 6px 10px; border-radius: 20px; background: rgba(122,140,114,0.16); color: var(--sage); font-size: 13px; font-weight: 600; letter-spacing: 0.1em;">RELIABLE</div>
+          </div>
+          <div style="flex: 1; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 28px 24px;">
+            <div style="font-family: var(--sans); font-weight: 700; font-size: 52px; color: var(--terracotta-l); line-height: 1;">4/10</div>
+            <div style="color: var(--stone); font-size: 18px; margin-top: 10px;">Tourist trap</div>
+            <div style="display: inline-block; margin-top: 12px; padding: 6px 10px; border-radius: 20px; background: rgba(232,168,130,0.14); color: var(--terracotta-l); font-size: 13px; font-weight: 600; letter-spacing: 0.1em;">AVOID</div>
+          </div>
+          <div style="flex: 1; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 28px 24px;">
+            <div style="font-family: var(--sans); font-weight: 700; font-size: 52px; color: var(--sage); line-height: 1;">10/10</div>
+            <div style="color: var(--stone); font-size: 18px; margin-top: 10px;">The speakeasy</div>
+            <div style="display: inline-block; margin-top: 12px; padding: 6px 10px; border-radius: 20px; background: rgba(122,140,114,0.16); color: var(--sage); font-size: 13px; font-weight: 600; letter-spacing: 0.1em;">TELL EVERYONE</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- phone mockup -->
+      <div style="display: flex; justify-content: center;">
+        <div class="phone" style="transform: rotate(2deg);">
+          <div class="notch"></div>
+          <div class="screen">
+            <div style="padding: 60px 24px 18px; text-align: center;">
+              <div style="font-family: var(--serif); font-weight: 700; font-size: 22px; color: var(--charcoal);">Your experiences, ranked</div>
+              <div style="font-size: 14px; color: var(--text-muted); margin-top: 6px;">47 experiences · 12 categories</div>
+            </div>
+            <div style="display: flex; padding: 0 20px 14px; gap: 6px;">
+              <div style="flex: 1; text-align: center; padding: 8px; font-size: 13px; font-weight: 600; background: var(--charcoal); color: var(--cream); border-radius: 8px;">All</div>
+              <div style="flex: 1; text-align: center; padding: 8px; font-size: 13px; font-weight: 600; color: var(--text-muted);">Food</div>
+              <div style="flex: 1; text-align: center; padding: 8px; font-size: 13px; font-weight: 600; color: var(--text-muted);">Drinks</div>
+              <div style="flex: 1; text-align: center; padding: 8px; font-size: 13px; font-weight: 600; color: var(--text-muted);">Activities</div>
+            </div>
+            <div style="padding: 0 20px; overflow: hidden;">
+              <div class="exp-row"><div class="left"><div class="thumb" style="background: #fce8d4;">🍜</div><div><div class="name">Siam Garden</div><div class="meta">Thai · East Village · Oct 4</div></div></div><div class="score score-good">8</div></div>
+              <div class="exp-row"><div class="left"><div class="thumb" style="background: #dfe8f5;">🍸</div><div><div class="name">The Violet Hour</div><div class="meta">Speakeasy · Wicker Park · Sep 28</div></div></div><div class="score score-high">10</div></div>
+              <div class="exp-row"><div class="left"><div class="thumb" style="background: #f4d9d4;">📸</div><div><div class="name">Times Square Wax</div><div class="meta">Attraction · Midtown · Sep 15</div></div></div><div class="score score-low">4</div></div>
+              <div class="exp-row"><div class="left"><div class="thumb" style="background: #dce7de;">🥾</div><div><div class="name">Breakneck Ridge</div><div class="meta">Hike · Hudson Valley · Sep 8</div></div></div><div class="score score-high">9</div></div>
+              <div class="exp-row"><div class="left"><div class="thumb" style="background: #e4d9ec;">🎭</div><div><div class="name">Sleep No More</div><div class="meta">Show · Chelsea · Aug 30</div></div></div><div class="score score-good">7</div></div>
+              <div class="exp-row"><div class="left"><div class="thumb" style="background: #fce8d4;">🍕</div><div><div class="name">Lucali</div><div class="meta">Pizza · Carroll Gdns · Aug 22</div></div></div><div class="score score-high">9</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Solution</span>
+    </div>
+    <div class="page-num">04 / 16</div>
+  </section>
+
+  <!-- 5. HOW IT WORKS ──────────────────────────────────────────────── -->
+  <section class="slide bg-deep" data-label="How it works">
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">How it works</div>
+      <div class="display" style="font-size: 88px;">
+        Three steps.<br/>Two seconds each.
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 36px; margin-top: 80px;">
+        <div class="glass" style="padding: 56px 44px;">
+          <div class="step-num">01</div>
+          <div class="display" style="font-size: 44px; margin-top: 24px;">Rate</div>
+          <div class="body-md" style="margin-top: 16px; font-size: 26px;">Tap a number. One to ten. No review required.</div>
+        </div>
+        <div class="glass" style="padding: 56px 44px;">
+          <div class="step-num">02</div>
+          <div class="display" style="font-size: 44px; margin-top: 24px;">Build</div>
+          <div class="body-md" style="margin-top: 16px; font-size: 26px;">Every rating compounds into a clear record of what you love.</div>
+        </div>
+        <div class="glass" style="padding: 56px 44px;">
+          <div class="step-num">03</div>
+          <div class="display" style="font-size: 44px; margin-top: 24px;">Discover</div>
+          <div class="body-md" style="margin-top: 16px; font-size: 26px;">See what's highly rated by people you trust. No strangers. No ads.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Product</span>
+    </div>
+    <div class="page-num">05 / 16</div>
+  </section>
+
+  <!-- 6. NETWORK EFFECT ────────────────────────────────────────────── -->
+  <section class="slide" data-label="Network effect">
+    <div class="frame" style="display: grid; grid-template-columns: 1.1fr 1fr; gap: 80px; align-items: center;">
+      <div>
+        <div class="eyebrow" style="margin-bottom: 32px;">The network effect</div>
+        <div class="display" style="font-size: 92px;">
+          Your friends<br/>are rating <em class="accent">too.</em>
+        </div>
+        <div class="body-lg" style="margin-top: 36px; max-width: 780px;">
+          Their ratings shape what you discover — not algorithms guessing from strangers, but the people you actually trust.
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 56px;">
+          <div style="padding: 28px; background: var(--cream-deep); border-radius: 14px;">
+            <div style="font-weight: 700; color: var(--charcoal); font-size: 24px; margin-bottom: 8px;">Dive bar finder</div>
+            <div style="color: var(--text-muted); font-size: 20px;">Their top-rated spots in your neighborhood.</div>
+          </div>
+          <div style="padding: 28px; background: var(--cream-deep); border-radius: 14px;">
+            <div style="font-weight: 700; color: var(--charcoal); font-size: 24px; margin-bottom: 8px;">Restaurant expert</div>
+            <div style="color: var(--text-muted); font-size: 20px;">Their 9s and 10s when you need somewhere new.</div>
+          </div>
+          <div style="padding: 28px; background: var(--cream-deep); border-radius: 14px;">
+            <div style="font-weight: 700; color: var(--charcoal); font-size: 24px; margin-bottom: 8px;">New-city explorer</div>
+            <div style="color: var(--text-muted); font-size: 20px;">Their discoveries become yours.</div>
+          </div>
+          <div style="padding: 28px; background: var(--sage-light); border-radius: 14px; border: 1px solid rgba(122,140,114,0.25);">
+            <div style="font-weight: 700; color: var(--charcoal); font-size: 22px; margin-bottom: 8px;">Works solo on day one</div>
+            <div style="color: var(--charcoal-soft); font-size: 20px;">Your history is useful before a single friend joins.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Friend network visualization -->
+      <div style="position: relative; height: 780px;">
+        <div style="position: absolute; top: 40px; left: 50%; transform: translateX(-50%); width: 240px; padding: 24px 20px; background: var(--warm-white); border-radius: 20px; box-shadow: 0 20px 60px rgba(26,23,20,0.08); border: 1px solid var(--stone-light);">
+          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+            <div style="width: 44px; height: 44px; border-radius: 50%; background: #e8a882; display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:18px;">P</div>
+            <div>
+              <div style="font-weight: 700; color: var(--charcoal); font-size: 16px;">Priya</div>
+              <div style="font-size: 12px; color: var(--text-muted);">rated just now</div>
+            </div>
+          </div>
+          <div style="font-family: var(--serif); font-size: 18px; color: var(--charcoal);">Café Integral</div>
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 8px;">
+            <div style="font-size: 13px; color: var(--text-muted);">Coffee · near you</div>
+            <div style="font-weight: 700; color: var(--sage); font-size: 28px;">9</div>
+          </div>
+        </div>
+
+        <div style="position: absolute; top: 330px; left: 20px; width: 220px; padding: 22px 18px; background: var(--warm-white); border-radius: 20px; box-shadow: 0 20px 60px rgba(26,23,20,0.08); border: 1px solid var(--stone-light); transform: rotate(-3deg);">
+          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 10px;">
+            <div style="width: 40px; height: 40px; border-radius: 50%; background: #7a8c72; display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:16px;">J</div>
+            <div style="font-weight: 700; color: var(--charcoal); font-size: 15px;">Jordan</div>
+          </div>
+          <div style="font-family: var(--serif); font-size: 17px; color: var(--charcoal);">Lucali</div>
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 6px;">
+            <div style="font-size: 12px; color: var(--text-muted);">Pizza</div>
+            <div style="font-weight: 700; color: var(--sage); font-size: 26px;">10</div>
+          </div>
+        </div>
+
+        <div style="position: absolute; top: 380px; right: 10px; width: 220px; padding: 22px 18px; background: var(--warm-white); border-radius: 20px; box-shadow: 0 20px 60px rgba(26,23,20,0.08); border: 1px solid var(--stone-light); transform: rotate(3deg);">
+          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 10px;">
+            <div style="width: 40px; height: 40px; border-radius: 50%; background: #c2653a; display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:16px;">M</div>
+            <div style="font-weight: 700; color: var(--charcoal); font-size: 15px;">Mika</div>
+          </div>
+          <div style="font-family: var(--serif); font-size: 17px; color: var(--charcoal);">Breakneck Ridge</div>
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 6px;">
+            <div style="font-size: 12px; color: var(--text-muted);">Hike</div>
+            <div style="font-weight: 700; color: var(--amber); font-size: 26px;">8</div>
+          </div>
+        </div>
+
+        <div style="position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%); padding: 18px 28px; background: var(--charcoal); color: var(--cream); border-radius: 999px; font-size: 18px; font-weight: 600;">
+          ↑ From people you trust
+        </div>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Network</span>
+    </div>
+    <div class="page-num">06 / 16</div>
+  </section>
+
+  <!-- 7. MARKET ────────────────────────────────────────────────────── -->
+  <section class="slide bg-deep" data-label="Market">
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">The market</div>
+      <div class="display" style="font-size: 88px;">
+        A <em class="accent">$47B</em> discovery market,<br/>mis-served by ads and strangers.
+      </div>
+
+      <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 36px; margin-top: 96px;">
+        <div>
+          <div class="mono" style="color: var(--terracotta); text-transform: uppercase; letter-spacing: 0.14em; font-size: 18px; margin-bottom: 16px;">TAM</div>
+          <div style="font-family: var(--serif); font-weight: 700; color: var(--charcoal); font-size: 96px; line-height: 1;">$47B</div>
+          <div class="body-md" style="margin-top: 16px;">Global local-discovery ad & platform spend across food, travel, events, wellness.</div>
+        </div>
+        <div>
+          <div class="mono" style="color: var(--terracotta); text-transform: uppercase; letter-spacing: 0.14em; font-size: 18px; margin-bottom: 16px;">SAM</div>
+          <div style="font-family: var(--serif); font-weight: 700; color: var(--charcoal); font-size: 96px; line-height: 1;">$8.2B</div>
+          <div class="body-md" style="margin-top: 16px;">US millennials & Gen Z who actively save, rate, or share going-out recs.</div>
+        </div>
+        <div>
+          <div class="mono" style="color: var(--terracotta); text-transform: uppercase; letter-spacing: 0.14em; font-size: 18px; margin-bottom: 16px;">SOM (Year 3)</div>
+          <div style="font-family: var(--serif); font-weight: 700; color: var(--charcoal); font-size: 96px; line-height: 1;">$240M</div>
+          <div class="body-md" style="margin-top: 16px;">2M active raters across 12 cities at a $10 ARPU / 1.5% take rate blend.</div>
+        </div>
+      </div>
+
+      <div class="body-md" style="margin-top: auto; color: var(--text-muted); font-size: 22px;">
+        Sources: eMarketer 2025 · Yelp 10-K · U.S. Census · internal model
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Market</span>
+    </div>
+    <div class="page-num">07 / 16</div>
+  </section>
+
+  <!-- 8. WHY NOW ───────────────────────────────────────────────────── -->
+  <section class="slide" data-label="Why now">
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">Why now</div>
+      <div class="display" style="font-size: 88px; max-width: 1500px;">
+        Review culture is <em class="accent">collapsing.</em><br/>
+        Trust is moving to networks.
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 32px; margin-top: 72px;">
+        <div style="padding: 40px; background: var(--cream-deep); border-radius: 20px;">
+          <div style="font-family: var(--serif); font-weight: 700; font-size: 72px; color: var(--terracotta); line-height: 1;">72%</div>
+          <div style="font-size: 22px; color: var(--charcoal); margin-top: 18px; line-height: 1.5;">of Gen Z don't trust Yelp or Google reviews.</div>
+          <div style="font-size: 16px; color: var(--text-muted); margin-top: 12px; font-family: var(--mono);">Morning Consult, 2024</div>
+        </div>
+        <div style="padding: 40px; background: var(--cream-deep); border-radius: 20px;">
+          <div style="font-family: var(--serif); font-weight: 700; font-size: 72px; color: var(--sage); line-height: 1;">4×</div>
+          <div style="font-size: 22px; color: var(--charcoal); margin-top: 18px; line-height: 1.5;">Beli's user growth YoY validates one-tap rating behavior.</div>
+          <div style="font-size: 16px; color: var(--text-muted); margin-top: 12px; font-family: var(--mono);">TechCrunch, 2025</div>
+        </div>
+        <div style="padding: 40px; background: var(--cream-deep); border-radius: 20px;">
+          <div style="font-family: var(--serif); font-weight: 700; font-size: 72px; color: var(--amber); line-height: 1;">61%</div>
+          <div style="font-size: 22px; color: var(--charcoal); margin-top: 18px; line-height: 1.5;">ask friends first for recs — yet no app captures that loop.</div>
+          <div style="font-size: 16px; color: var(--text-muted); margin-top: 12px; font-family: var(--mono);">Pew Research, 2024</div>
+        </div>
+      </div>
+
+      <div class="pullquote" style="font-size: 34px; margin-top: 64px; padding-left: 24px; border-left: 3px solid var(--terracotta); max-width: 1400px;">
+        Instagram ate photos. TikTok ate video. Nobody's eaten the rec yet.
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Timing</span>
+    </div>
+    <div class="page-num">08 / 16</div>
+  </section>
+
+  <!-- 9. COMPETITION ───────────────────────────────────────────────── -->
+  <section class="slide bg-deep" data-label="Competition">
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 28px;">Competition</div>
+      <div class="display" style="font-size: 80px;">
+        Beli — but for <em class="accent">everything.</em>
+      </div>
+
+      <div style="margin-top: 60px;">
+        <table class="compete">
+          <thead>
+            <tr>
+              <th style="width: 22%;"></th>
+              <th>One-tap rating</th>
+              <th>Friend-first feed</th>
+              <th>Beyond restaurants</th>
+              <th>Personal history</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Yelp</td>
+              <td><span class="cross">✕</span></td>
+              <td><span class="cross">✕</span></td>
+              <td>Partial</td>
+              <td><span class="cross">✕</span></td>
+            </tr>
+            <tr>
+              <td>Google Maps</td>
+              <td><span class="cross">✕</span></td>
+              <td><span class="cross">✕</span></td>
+              <td>Partial</td>
+              <td>Saves only</td>
+            </tr>
+            <tr>
+              <td>Beli</td>
+              <td><span class="check">✓</span></td>
+              <td><span class="check">✓</span></td>
+              <td>Food only</td>
+              <td>Food only</td>
+            </tr>
+            <tr>
+              <td>Notes / Sheets</td>
+              <td>Manual</td>
+              <td><span class="cross">✕</span></td>
+              <td><span class="check">✓</span></td>
+              <td>Manual</td>
+            </tr>
+            <tr class="us">
+              <td>Vouch<span style="color: var(--terracotta);">.</span></td>
+              <td><span class="check">✓</span></td>
+              <td><span class="check">✓</span></td>
+              <td><span class="check">✓</span></td>
+              <td><span class="check">✓</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Competition</span>
+    </div>
+    <div class="page-num">09 / 16</div>
+  </section>
+
+  <!-- 10. BUSINESS MODEL ───────────────────────────────────────────── -->
+  <section class="slide" data-label="Business model">
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">Business model</div>
+      <div class="display" style="font-size: 88px;">
+        Free today,<br/><em class="accent">compounding</em> tomorrow.
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 28px; margin-top: 80px;">
+        <div class="glass" style="padding: 44px 36px;">
+          <div class="mono" style="color: var(--terracotta); font-size: 16px; letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 20px;">Phase 1 · Now</div>
+          <div class="display" style="font-size: 40px; margin-bottom: 16px;">Free consumer app</div>
+          <div class="body-md" style="font-size: 22px;">Grow the rating graph. No ads. Ever. Density is the moat.</div>
+        </div>
+        <div class="glass" style="padding: 44px 36px;">
+          <div class="mono" style="color: var(--terracotta); font-size: 16px; letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 20px;">Phase 2 · Year 2</div>
+          <div class="display" style="font-size: 40px; margin-bottom: 16px;">Vouch+ subscription</div>
+          <div class="body-md" style="font-size: 22px;">$5/mo · trip planning, advanced filters, taste recaps, offline.</div>
+        </div>
+        <div class="glass" style="padding: 44px 36px;">
+          <div class="mono" style="color: var(--terracotta); font-size: 16px; letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 20px;">Phase 3 · Year 3</div>
+          <div class="display" style="font-size: 40px; margin-bottom: 16px;">Reservations API</div>
+          <div class="body-md" style="font-size: 22px;">1.5% take on bookings routed through trusted-friend ratings.</div>
+        </div>
+      </div>
+
+      <div style="margin-top: 64px; padding: 32px 40px; background: var(--charcoal); color: var(--cream); border-radius: 20px; display: flex; align-items: center; justify-content: space-between;">
+        <div style="font-family: var(--serif); font-size: 32px;">Year-3 blended ARPU target</div>
+        <div style="font-family: var(--serif); font-weight: 700; font-size: 72px; color: var(--terracotta-l); line-height: 1;">$12 / user / yr</div>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Monetization</span>
+    </div>
+    <div class="page-num">10 / 16</div>
+  </section>
+
+  <!-- 11. TRACTION ─────────────────────────────────────────────────── -->
+  <section class="slide bg-charcoal" data-label="Traction">
+    <div class="blob s" style="width: 700px; height: 700px; left: -200px; top: -200px; opacity: 0.2;"></div>
+    <div class="blob t" style="width: 500px; height: 500px; right: -150px; bottom: -150px; opacity: 0.2;"></div>
+
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">Early signal</div>
+      <div class="display" style="font-size: 92px;">
+        3 months. <em class="accent">One city.</em> Signal everywhere.
+      </div>
+
+      <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 32px; margin-top: 80px;">
+        <div>
+          <div class="metric-huge" style="font-size: 120px;"><em>100</em></div>
+          <div class="body-md" style="color: var(--stone); margin-top: 20px; font-size: 22px;">active raters in NYC beta</div>
+        </div>
+        <div>
+          <div class="metric-huge" style="font-size: 120px; color: var(--terracotta-l);">411</div>
+          <div class="body-md" style="color: var(--stone); margin-top: 20px; font-size: 22px;">experiences rated to date</div>
+        </div>
+        <div>
+          <div class="metric-huge" style="font-size: 120px; color: var(--sage);">58%</div>
+          <div class="body-md" style="color: var(--stone); margin-top: 20px; font-size: 22px;">W4 retention (Beli: ~38%)</div>
+        </div>
+        <div>
+          <div class="metric-huge" style="font-size: 120px; color: var(--amber);">4.1</div>
+          <div class="body-md" style="color: var(--stone); margin-top: 20px; font-size: 22px;">avg ratings per active user</div>
+        </div>
+      </div>
+
+      <div style="margin-top: 80px; display: grid; grid-template-columns: 1fr 1fr; gap: 36px;">
+        <div style="padding: 32px 36px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px;">
+          <div class="pullquote" style="font-size: 24px; color: var(--cream);">"I used to keep a Google Sheet of every restaurant. This replaced it in a day."</div>
+          <div style="margin-top: 16px; color: var(--terracotta-l); font-weight: 600; font-size: 18px;">Mika · Brooklyn</div>
+        </div>
+        <div style="padding: 32px 36px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px;">
+          <div class="pullquote" style="font-size: 24px; color: var(--cream);">"I've tried five apps like this. This is the only one I opened a second time."</div>
+          <div style="margin-top: 16px; color: var(--terracotta-l); font-weight: 600; font-size: 18px;">Dante · LA</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Traction</span>
+    </div>
+    <div class="page-num">11 / 16</div>
+  </section>
+
+  <!-- 12. GO-TO-MARKET ─────────────────────────────────────────────── -->
+  <section class="slide" data-label="Go to market">
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">Go-to-market</div>
+      <div class="display" style="font-size: 88px;">
+        City by city. <em class="accent">Friend by friend.</em>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 32px; margin-top: 72px;">
+        <div>
+          <div class="mono" style="color: var(--terracotta); letter-spacing: 0.14em; text-transform: uppercase; font-size: 18px; margin-bottom: 16px;">Step 1 — Seed</div>
+          <div class="display" style="font-size: 44px; margin-bottom: 20px;">Tastemakers</div>
+          <div class="body-md">Recruit 100 high-volume raters per city — food writers, local creators, scene regulars. Their ratings seed density.</div>
+        </div>
+        <div>
+          <div class="mono" style="color: var(--terracotta); letter-spacing: 0.14em; text-transform: uppercase; font-size: 18px; margin-bottom: 16px;">Step 2 — Spread</div>
+          <div class="display" style="font-size: 44px; margin-bottom: 20px;">Friend invites</div>
+          <div class="body-md">Every user has a shareable profile. Sending a profile is how you answer "where should we eat?"</div>
+        </div>
+        <div>
+          <div class="mono" style="color: var(--terracotta); letter-spacing: 0.14em; text-transform: uppercase; font-size: 18px; margin-bottom: 16px;">Step 3 — Saturate</div>
+          <div class="display" style="font-size: 44px; margin-bottom: 20px;">Vertical playbooks</div>
+          <div class="body-md">Replicate the food playbook for bars, hikes, shows, trips. Each vertical = its own flywheel on the same graph.</div>
+        </div>
+      </div>
+
+      <div style="margin-top: auto; display: flex; align-items: center; gap: 40px; padding: 32px 40px; background: var(--cream-deep); border-radius: 20px;">
+        <div style="font-family: var(--serif); font-weight: 700; font-size: 36px; color: var(--charcoal);">City rollout</div>
+        <div style="flex: 1; display: flex; gap: 14px; flex-wrap: wrap;">
+          <span style="padding: 10px 20px; background: var(--terracotta); color: var(--cream); border-radius: 999px; font-weight: 600; font-size: 20px;">NYC</span>
+          <span style="padding: 10px 20px; background: var(--terracotta); color: var(--cream); border-radius: 999px; font-weight: 600; font-size: 20px;">Chicago</span>
+          <span style="padding: 10px 20px; background: var(--charcoal); color: var(--cream); border-radius: 999px; font-weight: 600; font-size: 20px;">LA · Q2</span>
+          <span style="padding: 10px 20px; background: var(--charcoal); color: var(--cream); border-radius: 999px; font-weight: 600; font-size: 20px;">Austin · Q3</span>
+          <span style="padding: 10px 20px; background: transparent; color: var(--text-muted); border: 1px dashed var(--stone); border-radius: 999px; font-weight: 600; font-size: 20px;">+ 8 by Y2</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>GTM</span>
+    </div>
+    <div class="page-num">12 / 16</div>
+  </section>
+
+  <!-- 13. ROADMAP ──────────────────────────────────────────────────── -->
+  <section class="slide bg-deep" data-label="Roadmap">
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">Roadmap</div>
+      <div class="display" style="font-size: 88px;">
+        From a rating app<br/>to a <em class="accent">taste graph.</em>
+      </div>
+
+      <div style="margin-top: 80px; position: relative;">
+        <div style="position: absolute; left: 0; right: 0; top: 44px; height: 2px; background: var(--stone);"></div>
+        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; position: relative;">
+          <div>
+            <div style="width: 24px; height: 24px; border-radius: 50%; background: var(--terracotta); border: 6px solid var(--cream-deep); position: relative; margin-left: 32px;"></div>
+            <div style="margin-top: 28px; padding-right: 20px;">
+              <div class="mono" style="color: var(--terracotta); letter-spacing: 0.12em; text-transform: uppercase; font-size: 16px; margin-bottom: 10px;">NOW</div>
+              <div class="display" style="font-size: 36px; margin-bottom: 12px;">NYC beta</div>
+              <div class="body-md" style="font-size: 20px;">One-tap rating, friend feed, personal history.</div>
+            </div>
+          </div>
+          <div>
+            <div style="width: 24px; height: 24px; border-radius: 50%; background: var(--terracotta); border: 6px solid var(--cream-deep); position: relative; margin-left: 32px;"></div>
+            <div style="margin-top: 28px; padding-right: 20px;">
+              <div class="mono" style="color: var(--terracotta); letter-spacing: 0.12em; text-transform: uppercase; font-size: 16px; margin-bottom: 10px;">Q3 2026</div>
+              <div class="display" style="font-size: 36px; margin-bottom: 12px;">Public launch</div>
+              <div class="body-md" style="font-size: 20px;">Vertical expansion — bars, hikes, shows. 4 cities.</div>
+            </div>
+          </div>
+          <div>
+            <div style="width: 24px; height: 24px; border-radius: 50%; background: var(--stone); border: 6px solid var(--cream-deep); position: relative; margin-left: 32px;"></div>
+            <div style="margin-top: 28px; padding-right: 20px;">
+              <div class="mono" style="color: var(--text-muted); letter-spacing: 0.12em; text-transform: uppercase; font-size: 16px; margin-bottom: 10px;">Q1 2027</div>
+              <div class="display" style="font-size: 36px; margin-bottom: 12px;">Vouch+</div>
+              <div class="body-md" style="font-size: 20px;">Trip planning, taste recaps, premium filters.</div>
+            </div>
+          </div>
+          <div>
+            <div style="width: 24px; height: 24px; border-radius: 50%; background: var(--stone); border: 6px solid var(--cream-deep); position: relative; margin-left: 32px;"></div>
+            <div style="margin-top: 28px; padding-right: 20px;">
+              <div class="mono" style="color: var(--text-muted); letter-spacing: 0.12em; text-transform: uppercase; font-size: 16px; margin-bottom: 10px;">Q3 2027</div>
+              <div class="display" style="font-size: 36px; margin-bottom: 12px;">Reservations</div>
+              <div class="body-md" style="font-size: 20px;">API layer. Revenue on bookings routed through trust.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Roadmap</span>
+    </div>
+    <div class="page-num">13 / 16</div>
+  </section>
+
+  <!-- 14. TEAM ─────────────────────────────────────────────────────── -->
+  <section class="slide" data-label="Team">
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">The team</div>
+      <div class="display" style="font-size: 88px;">
+        Shipped it ourselves.<br/><em class="accent">Live today.</em>
+      </div>
+
+      <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 32px; margin-top: 96px;">
+        <div>
+          <div class="display" style="font-size: 44px;">Gaurav Agarwal</div>
+          <div class="body-md" style="font-size: 20px; margin-top: 18px;">Full-stack + infra. Built the rating graph, tastemaker system, and the production data layer.</div>
+        </div>
+        <div>
+          <div class="display" style="font-size: 44px;">Tushar Mittal</div>
+          <div class="body-md" style="font-size: 20px; margin-top: 18px;">Full-stack lead. Shipped Map, Feed, Search, Profile, and Lists end-to-end.</div>
+        </div>
+        <div>
+          <div class="display" style="font-size: 44px;">Cynthia Jin</div>
+          <div class="body-md" style="font-size: 20px; margin-top: 18px;">Brand + growth. Led the synthetic-testing pipeline and the demand-gen experiments.</div>
+        </div>
+        <div>
+          <div class="display" style="font-size: 44px;">Mandy Cheng</div>
+          <div class="body-md" style="font-size: 20px; margin-top: 18px;">Design + GTM. Owned the editorial visual system and the onboarding flow.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Team</span>
+    </div>
+    <div class="page-num">14 / 16</div>
+  </section>
+
+  <!-- 15. ASK ──────────────────────────────────────────────────────── -->
+  <section class="slide bg-charcoal" data-label="The ask">
+    <div class="blob t" style="width: 700px; height: 700px; right: -200px; top: -200px; opacity: 0.22;"></div>
+
+    <div class="frame">
+      <div class="eyebrow" style="margin-bottom: 32px;">The ask</div>
+      <div class="display" style="font-size: 96px;">
+        Raising <em class="accent">$200K</em> pre-seed<br/>
+        to validate the loop in NYC.
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 56px; margin-top: 96px; align-items: start;">
+        <div>
+          <div class="mono" style="color: var(--terracotta-l); letter-spacing: 0.14em; text-transform: uppercase; font-size: 18px; margin-bottom: 24px;">Use of funds</div>
+          <div style="display: flex; flex-direction: column; gap: 20px;">
+            <div style="display: flex; align-items: center; gap: 24px;">
+              <div style="width: 80px; font-family: var(--serif); font-weight: 700; font-size: 40px; color: var(--terracotta-l);">50%</div>
+              <div style="flex: 1;">
+                <div style="color: var(--cream); font-weight: 700; font-size: 24px;">Engineering & product</div>
+                <div style="color: var(--stone); font-size: 20px; margin-top: 4px;">Ship Vouch+ MVP, recsys v2, native iOS shell. One contractor + AI tooling.</div>
+              </div>
+            </div>
+            <div style="height: 1px; background: rgba(255,255,255,0.1);"></div>
+            <div style="display: flex; align-items: center; gap: 24px;">
+              <div style="width: 80px; font-family: var(--serif); font-weight: 700; font-size: 40px; color: var(--terracotta-l);">30%</div>
+              <div style="flex: 1;">
+                <div style="color: var(--cream); font-weight: 700; font-size: 24px;">NYC growth</div>
+                <div style="color: var(--stone); font-size: 20px; margin-top: 4px;">First paid-acquisition tests + tastemaker incentives.</div>
+              </div>
+            </div>
+            <div style="height: 1px; background: rgba(255,255,255,0.1);"></div>
+            <div style="display: flex; align-items: center; gap: 24px;">
+              <div style="width: 80px; font-family: var(--serif); font-weight: 700; font-size: 40px; color: var(--terracotta-l);">20%</div>
+              <div style="flex: 1;">
+                <div style="color: var(--cream); font-weight: 700; font-size: 24px;">Runway & ops</div>
+                <div style="color: var(--stone); font-size: 20px; margin-top: 4px;">6 months to seed-stage metrics in NYC.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="padding: 48px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 24px;">
+          <div class="mono" style="color: var(--terracotta-l); letter-spacing: 0.14em; text-transform: uppercase; font-size: 18px; margin-bottom: 28px;">6-month milestones</div>
+          <div style="display: flex; flex-direction: column; gap: 24px;">
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <div style="color: var(--stone); font-size: 24px;">Active raters</div>
+              <div style="font-family: var(--serif); font-weight: 700; color: var(--cream); font-size: 44px;">2K</div>
+            </div>
+            <div style="height: 1px; background: rgba(255,255,255,0.08);"></div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <div style="color: var(--stone); font-size: 24px;">Cities deep</div>
+              <div style="font-family: var(--serif); font-weight: 700; color: var(--cream); font-size: 44px;">1</div>
+            </div>
+            <div style="height: 1px; background: rgba(255,255,255,0.08);"></div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <div style="color: var(--stone); font-size: 24px;">Ratings in graph</div>
+              <div style="font-family: var(--serif); font-weight: 700; color: var(--cream); font-size: 44px;">50K</div>
+            </div>
+            <div style="height: 1px; background: rgba(255,255,255,0.08);"></div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 20px;">
+              <div style="color: var(--stone); font-size: 24px;">W4 retention</div>
+              <div style="font-family: var(--serif); font-weight: 700; color: var(--cream); font-size: 44px; white-space: nowrap;">≥ 50%</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chrome">
+      <span class="wordmark">Vouch<span class="dot">.</span></span>
+      <span class="sep"></span>
+      <span>Ask</span>
+    </div>
+    <div class="page-num">15 / 16</div>
+  </section>
+
+  <!-- 16. CLOSE ────────────────────────────────────────────────────── -->
+  <section class="slide" data-label="Close">
+    <div class="blob t" style="width: 900px; height: 900px; left: 50%; top: 50%; transform: translate(-50%,-50%); opacity: 0.18;"></div>
+
+    <div class="frame" style="justify-content: center; align-items: center; text-align: center;">
+      <div class="eyebrow" style="margin-bottom: 40px;">Vouch.</div>
+      <div class="display" style="font-size: 200px; letter-spacing: -0.025em;">
+        Less mediocre.<br/><em class="accent">More you.</em>
+      </div>
+      <div class="body-lg" style="margin-top: 72px; max-width: 1000px;">
+        Your best experiences already exist — scattered across memory, notes apps, and group chats. Vouch puts them in one place.
+      </div>
+      <div class="mono" style="margin-top: 80px; color: var(--text-muted); font-size: 22px; letter-spacing: 0.14em;">
+        hello@vouch.app  ·  vouch.app
+      </div>
+    </div>
+
+    <div class="page-num">16 / 16</div>
+  </section>
+
+</deck-stage>
+
+</body>
+</html>
